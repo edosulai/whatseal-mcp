@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "approvedAt": "YYYY-MM-DDTHH:mm:ss.sssZ",
+  "approved": {
+    "whatsappWebVersion": "2.x",
+    "browserVersion": "Chrome/x.x.x.x",
+    "nodeVersion": "v22.x.x",
+    "platform": "darwin-arm64",
+    "backendVersion": "x.x.x",
+    "whatsappWebJsVersion": "x.x.x",
+    "whatsappWebJsSource": "github:wwebjs/whatsapp-web.js#COMMIT",
+    "whatsappWebJsResolved": "git+https://github.com/wwebjs/whatsapp-web.js.git#COMMIT",
+    "whatsappWebJsIntegrity": "sha512-...",
+    "packageLockSha256": "sha256-hex",
+    "backendStartupSourceSha256": "sha256-hex",
+    "backendCurrentDiskSourceSha256": "sha256-hex",
+    "backendSourceMatchesStartup": true,
+    "installedDependenciesStartupSha256": "sha256-hex",
+    "messageApprovalHelperSha256": "sha256-hex",
+    "baselineApprovalHelperSha256": "sha256-hex",
+    "mcpSdkVersion": "x.x.x",
+    "qrcodeVersion": "x.x.x",
+    "zodVersion": "x.x.x"
+  },
+  "acceptance": {
+    "backendReady": true,
+    "qrRemoved": true,
+    "privateSocketMode": "0600",
+    "devtoolsTcpPort": false,
+    "chatListWithoutPreviews": true,
+    "messageReadWithoutSeenMutation": "operator-verified",
+    "sendFlow": "native-user-authentication-required"
+  }
+}
