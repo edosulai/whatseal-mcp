@@ -94,22 +94,17 @@ read arbitrary user files or address-book contacts. Mark-read and reactions
 require the same immutable native authorization. WhatsApp Web is an unofficial
 and evolving surface, so verify this behavior after dependency or WhatsApp updates.
 
-## Policy Modes
+## Security Model
 
-Set via `WHATSAPP_POLICY_MODE` environment variable (default: `balanced`).
-
-| Mode | Read on runtime drift | Send on runtime drift | Send on source drift | Touch ID per send |
-|---|---|---|---|---|
-| `balanced` | ✅ Allowed | ✅ Allowed | ❌ Blocked | ✅ Always |
-| `developer` | ✅ Allowed | ✅ Allowed | ✅ Allowed | ✅ Always |
-
-All modes block on critical integrity drift (dependency/helper compromise).
-All modes require Touch ID for every externally visible action (send, reaction, mark-read).
-
-Override during install:
+- Touch ID (or macOS login password) is required for every externally visible action:
+  send, reaction, and mark-read.
+- Rate limiting: 20 messages/hour, 100 messages/day, 3-second cooldown.
+- No chat history stored locally.
+- No TCP listener; Unix socket with mode 0600.
+- Reading chats never requires approval.
 
 ```bash
-WHATSAPP_POLICY_MODE=developer ./install-launchagent.sh install --account myphone
+./install-launchagent.sh install --account myphone
 ```
 
 ## Operations

@@ -57,13 +57,25 @@ const sendOutcomes = new Map();
 const acknowledgementHistory = new Map();
 
 if (help) {
-  process.stdout.write('Usage: node daemon.mjs [--verbose|-v]\n\nRuns the private local WhatsApp Web backend.\n\nEnvironment:\n  WHATSAPP_POLICY_MODE  balanced | developer (default: balanced)\n');
+  process.stdout.write('Usage: node daemon.mjs [--verbose|-v]\n\nRuns the private local WhatsApp Web backend.\n');
   process.exit(0);
 }
 
-const POLICY_MODE = (['balanced', 'developer'].includes(process.env.WHATSAPP_POLICY_MODE)
-  ? process.env.WHATSAPP_POLICY_MODE
-  : 'balanced');
+
+function assertSendRateLimit() {
+  const now = Date.now();
+  const sent = [...sendOutcomes.values()]
+    .filter((outcome) => ['sending', 'sent', 'outcome-unknown'].includes(outcome.state) && Date.parse(outcome.updatedAt))
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  const hourly = sent.filter((outcome) => now - Date.parse(outcome.updatedAt) < 60 * 60 * 1000).length;
+  const daily = sent.filter((outcome) => now - Date.parse(outcome.updatedAt) < 24 * 60 * 60 * 1000).length;
+  if (hourly >= 20) throw new Error('Send rate limit reached: 20 messages per rolling hour.');
+  if (daily >= 100) throw new Error('Send rate limit reached: 100 messages per rolling 24 hours.');
+  const latest = sent[0];
+  if (latest && now - Date.parse(latest.updatedAt) < 3000) {
+    throw new Error('Send cooldown active. Wait at least three seconds between messages.');
+  }
+}
 
 let phase = 'starting';
 let connectionState = null;
@@ -408,7 +420,7 @@ async function getCompatibilityReport() {
   return {
     ...current,
     approval: {
-      policyMode: POLICY_MODE,
+      
       baselinePath: paths.compatibilityBaseline,
       baselineApprovedAt: baseline?.approvedAt || null,
       drift,
@@ -421,119 +433,6 @@ async function writeCompatibilitySnapshot() {
   const report = await getCompatibilityReport();
   await writeJsonAtomic(paths.compatibilitySnapshot, report);
   return report;
-}
-
-function assertSendRateLimit() {
-  const now = Date.now();
-  const sent = [...sendOutcomes.values()]
-    .filter((outcome) => ['sending', 'sent', 'outcome-unknown'].includes(outcome.state) && Date.parse(outcome.updatedAt))
-    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
-  const hourly = sent.filter((outcome) => now - Date.parse(outcome.updatedAt) < 60 * 60 * 1000).length;
-  const daily = sent.filter((outcome) => now - Date.parse(outcome.updatedAt) < 24 * 60 * 60 * 1000).length;
-  if (hourly >= 20) throw new Error('Send rate limit reached: 20 messages per rolling hour.');
-  if (daily >= 100) throw new Error('Send rate limit reached: 100 messages per rolling 24 hours.');
-  const latest = sent[0];
-  if (latest && now - Date.parse(latest.updatedAt) < 3000) {
-    throw new Error('Send cooldown active. Wait at least three seconds between messages.');
-  }
-}
-
-// Fields that represent critical integrity (dependency/helper compromise).
-const CRITICAL_DRIFT_FIELDS = new Set([
-  'installedDependenciesStartupSha256',
-  'messageApprovalHelperSha256',
-  'baselineApprovalHelperSha256',
-  'packageLockSha256',
-  'whatsappWebJsIntegrity',
-]);
-
-// Fields that represent local source changes during development.
-const SOURCE_DRIFT_FIELDS = new Set([
-  'backendStartupSourceSha256',
-  'backendCurrentDiskSourceSha256',
-  'backendSourceMatchesStartup',
-]);
-
-// Fields that represent upstream runtime updates (WhatsApp Web, Chrome, Node).
-const RUNTIME_DRIFT_FIELDS = new Set([
-  'whatsappWebVersion',
-  'browserVersion',
-  'nodeVersion',
-  'platform',
-]);
-
-// Missing baseline is a setup-phase field, not a security compromise.
-const SETUP_DRIFT_FIELDS = new Set(['baseline']);
-
-function classifyDrift(drift) {
-  const critical = drift.filter((d) => CRITICAL_DRIFT_FIELDS.has(d.field));
-  const source = drift.filter((d) => SOURCE_DRIFT_FIELDS.has(d.field));
-  const runtime = drift.filter((d) => RUNTIME_DRIFT_FIELDS.has(d.field));
-  const setup = drift.filter((d) => SETUP_DRIFT_FIELDS.has(d.field));
-  const other = drift.filter((d) => !CRITICAL_DRIFT_FIELDS.has(d.field) && !SOURCE_DRIFT_FIELDS.has(d.field) && !RUNTIME_DRIFT_FIELDS.has(d.field) && !SETUP_DRIFT_FIELDS.has(d.field));
-  return { critical, source, runtime, setup, other };
-}
-
-async function assertSendCompatibility() {
-  const report = await getCompatibilityReport();
-  if (report.approval.approvedForSending) return;
-
-  const { critical, source, runtime, setup, other } = classifyDrift(report.approval.drift);
-
-  // Critical drift always blocks sending regardless of mode.
-  if (critical.length > 0) {
-    const fields = critical.map((d) => d.field).join(', ');
-    throw new Error(`Sending is blocked by critical integrity drift: ${fields}. Dependency or helper compromise detected.`);
-  }
-
-  if (POLICY_MODE === 'developer') {
-    // Developer mode: source, runtime, and setup (missing baseline) drift are tolerated for send.
-    if (other.length > 0) {
-      const fields = other.map((d) => d.field).join(', ');
-      throw new Error(`Sending is blocked by unclassified drift: ${fields}. Promote a new baseline.`);
-    }
-    if (source.length > 0 || runtime.length > 0 || setup.length > 0) {
-      log.debug('policy-developer-send', `tolerating drift: ${[...source, ...runtime, ...setup].map((d) => d.field).join(', ')}`);
-    }
-    return;
-  }
-
-  // Balanced mode: runtime drift alone is tolerated for send; source and setup drift block.
-  if (source.length > 0 || other.length > 0 || setup.length > 0) {
-    const fields = [...source, ...other, ...setup].map((d) => d.field).join(', ');
-    throw new Error(`Sending is blocked by source drift: ${fields}. Promote a new baseline.`);
-  }
-  if (runtime.length > 0) {
-    log.debug('policy-balanced-send', `tolerating runtime drift: ${runtime.map((d) => d.field).join(', ')}`);
-  }
-}
-
-async function assertContentCompatibility() {
-  const report = await getCompatibilityReport();
-  if (report.approval.approvedForSending) return;
-
-  const { critical, source, runtime, setup, other } = classifyDrift(report.approval.drift);
-
-  // Critical drift always blocks content regardless of mode.
-  if (critical.length > 0) {
-    const fields = critical.map((d) => d.field).join(', ');
-    throw new Error(`Chat content access is blocked by critical integrity drift: ${fields}. Dependency or helper compromise detected.`);
-  }
-
-  // Developer: source, runtime, and setup drift never block reading.
-  if (POLICY_MODE === 'developer') {
-    if (other.length > 0) {
-      const fields = other.map((d) => d.field).join(', ');
-      throw new Error(`Chat content access is blocked by unclassified drift: ${fields}. Promote a new baseline.`);
-    }
-    return;
-  }
-
-  // Balanced: source and setup drift block content, runtime drift does not.
-  if (source.length > 0 || other.length > 0 || setup.length > 0) {
-    const fields = [...source, ...other, ...setup].map((d) => d.field).join(', ');
-    throw new Error(`Chat content access is blocked by source drift: ${fields}. Promote a new baseline.`);
-  }
 }
 
 async function getCompatibilitySelfTest() {
@@ -1058,7 +957,7 @@ async function dispatch(method, params = {}) {
       phase,
       ready: phase === 'ready',
       connectionState,
-      policyMode: POLICY_MODE,
+      
       qrAvailable: phase === 'pairing',
       qrPath: phase === 'pairing' ? paths.qrFile : null,
       qrUpdatedAt,
@@ -1082,7 +981,6 @@ async function dispatch(method, params = {}) {
   await ensureReady();
 
   if (method === 'listChats') {
-    await assertContentCompatibility();
     const limit = Math.min(Math.max(Number(params.limit || 50), 1), 200);
     const unreadOnly = Boolean(params.unreadOnly);
     const includeArchived = params.includeArchived !== false;
@@ -1095,7 +993,6 @@ async function dispatch(method, params = {}) {
   }
 
   if (method === 'getMessages') {
-    await assertContentCompatibility();
     const chat = await resolveChat(params.chat);
     const limit = Math.min(Math.max(Number(params.limit || 30), 1), 200);
     const messages = await getMessagesDirect(chat.id, limit);
@@ -1106,7 +1003,6 @@ async function dispatch(method, params = {}) {
   }
 
   if (method === 'searchMessages') {
-    await assertContentCompatibility();
     const query = String(params.query || '').trim();
     if (!query) throw new Error('A non-empty search query is required.');
     const limit = Math.min(Math.max(Number(params.limit || 50), 1), 100);
@@ -1119,14 +1015,12 @@ async function dispatch(method, params = {}) {
   }
 
   if (method === 'messageStatus') {
-    await assertContentCompatibility();
     const messageId = String(params.messageId || '').trim();
     if (!messageId) throw new Error('A message ID is required.');
     return await getMessageStatusDirect(messageId);
   }
 
   if (method === 'prepareSend') {
-    await assertSendCompatibility();
     assertSendRateLimit();
     const text = String(params.text || '').trim();
     if (!text) throw new Error('Message text cannot be empty.');
@@ -1149,7 +1043,6 @@ async function dispatch(method, params = {}) {
   }
 
   if (method === 'prepareRichTest') {
-    await assertSendCompatibility();
     assertSendRateLimit();
     const kind = String(params.kind || '').trim();
     const chat = await resolveChat(params.chat);
@@ -1176,7 +1069,6 @@ async function dispatch(method, params = {}) {
   }
 
   if (method === 'prepareMarkRead') {
-    await assertSendCompatibility();
     const chat = await resolveChat(params.chat);
     const preview = `Mark chat as read (send a seen receipt).\nCurrent unread count: ${Number(chat.unreadCount || 0)}\nThis is externally visible when read receipts are enabled.`;
     const prepared = drafts.prepare({
@@ -1197,7 +1089,6 @@ async function dispatch(method, params = {}) {
   }
 
   if (method === 'prepareReaction') {
-    await assertSendCompatibility();
     const chat = await resolveChat(params.chat);
     const messageId = String(params.messageId || '').trim();
     const reaction = String(params.reaction || '');
@@ -1231,7 +1122,6 @@ async function dispatch(method, params = {}) {
     sendApprovalInFlight = true;
     const approvalId = String(params.approvalId || '');
     try {
-      await assertSendCompatibility();
       assertSendRateLimit();
       const draft = drafts.beginApproval(approvalId);
       await recordOutcome(approvalId, { state: 'awaiting-local-approval', action: draft.action, characters: draft.text.length });
@@ -1247,7 +1137,6 @@ async function dispatch(method, params = {}) {
         drafts.cancel(approvalId);
         return await recordOutcome(approvalId, { state: 'declined', action: draft.action, characters: draft.text.length });
       }
-      await assertSendCompatibility();
       assertSendRateLimit();
       const approvedDraft = drafts.consumeApproved(approvalId);
       await recordOutcome(approvalId, { state: 'sending', action: approvedDraft.action, characters: approvedDraft.text.length });

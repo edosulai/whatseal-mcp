@@ -132,7 +132,6 @@ render_plist() {
     <key>WHATSAPP_AGENT_ROOT</key><string>${BASE_ROOT_DIR}</string>
     <key>WHATSAPP_CHROME_PATH</key><string>${CHROME_PATH}</string>
     <key>WHATSAPP_APPROVAL_HELPER</key><string>${APPROVAL_HELPER}</string>
-    <key>WHATSAPP_POLICY_MODE</key><string>${WHATSAPP_POLICY_MODE:-balanced}</string>
     <key>WHATSAPP_ACCOUNT_ID</key><string>${ACCOUNT_ID}</string>
   </dict>
   <key>Umask</key><integer>63</integer>
