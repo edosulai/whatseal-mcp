@@ -57,11 +57,11 @@ const sendOutcomes = new Map();
 const acknowledgementHistory = new Map();
 
 if (help) {
-  process.stdout.write('Usage: node daemon.mjs [--verbose|-v]\n\nRuns the private local WhatsApp Web backend.\n\nEnvironment:\n  WHATSAPP_POLICY_MODE  strict | balanced | developer (default: balanced)\n');
+  process.stdout.write('Usage: node daemon.mjs [--verbose|-v]\n\nRuns the private local WhatsApp Web backend.\n\nEnvironment:\n  WHATSAPP_POLICY_MODE  balanced | developer (default: balanced)\n');
   process.exit(0);
 }
 
-const POLICY_MODE = (['strict', 'balanced', 'developer'].includes(process.env.WHATSAPP_POLICY_MODE)
+const POLICY_MODE = (['balanced', 'developer'].includes(process.env.WHATSAPP_POLICY_MODE)
   ? process.env.WHATSAPP_POLICY_MODE
   : 'balanced');
 
@@ -486,11 +486,6 @@ async function assertSendCompatibility() {
     throw new Error(`Sending is blocked by critical integrity drift: ${fields}. Dependency or helper compromise detected.`);
   }
 
-  if (POLICY_MODE === 'strict') {
-    const fields = report.approval.drift.map((d) => d.field).join(', ');
-    throw new Error(`Sending is blocked by compatibility drift: ${fields}. Run read-only acceptance tests and explicitly promote a new baseline.`);
-  }
-
   if (POLICY_MODE === 'developer') {
     // Developer mode: source, runtime, and setup (missing baseline) drift are tolerated for send.
     if (other.length > 0) {
@@ -523,11 +518,6 @@ async function assertContentCompatibility() {
   if (critical.length > 0) {
     const fields = critical.map((d) => d.field).join(', ');
     throw new Error(`Chat content access is blocked by critical integrity drift: ${fields}. Dependency or helper compromise detected.`);
-  }
-
-  if (POLICY_MODE === 'strict') {
-    const fields = report.approval.drift.map((d) => d.field).join(', ');
-    throw new Error(`Chat content access is blocked by compatibility drift: ${fields}. Run the content-free self-test and explicitly promote a new baseline.`);
   }
 
   // Developer: source, runtime, and setup drift never block reading.

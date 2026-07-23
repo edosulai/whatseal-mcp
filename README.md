@@ -100,7 +100,6 @@ Set via `WHATSAPP_POLICY_MODE` environment variable (default: `balanced`).
 
 | Mode | Read on runtime drift | Send on runtime drift | Send on source drift | Touch ID per send |
 |---|---|---|---|---|
-| `strict` | ❌ Blocked | ❌ Blocked | ❌ Blocked | ✅ Always |
 | `balanced` | ✅ Allowed | ✅ Allowed | ❌ Blocked | ✅ Always |
 | `developer` | ✅ Allowed | ✅ Allowed | ✅ Allowed | ✅ Always |
 
@@ -110,7 +109,7 @@ All modes require Touch ID for every externally visible action (send, reaction, 
 Override during install:
 
 ```bash
-WHATSAPP_POLICY_MODE=developer ./install-launchagent.sh install
+WHATSAPP_POLICY_MODE=developer ./install-launchagent.sh install --account myphone
 ```
 
 ## Operations
