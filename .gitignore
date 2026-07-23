@@ -1,11 +1,4 @@
 node_modules/
-.local/
+.node_modules.previous.*
+.node_modules.installing.*
 *.log
-*.tmp
-auth/
-state/
-send-ledger.json
-compatibility-baseline.json
-compatibility-snapshot.json
-status.json
-pairing-qr.png

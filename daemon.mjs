@@ -462,19 +462,23 @@ const RUNTIME_DRIFT_FIELDS = new Set([
   'platform',
 ]);
 
+// Missing baseline is a setup-phase field, not a security compromise.
+const SETUP_DRIFT_FIELDS = new Set(['baseline']);
+
 function classifyDrift(drift) {
   const critical = drift.filter((d) => CRITICAL_DRIFT_FIELDS.has(d.field));
   const source = drift.filter((d) => SOURCE_DRIFT_FIELDS.has(d.field));
   const runtime = drift.filter((d) => RUNTIME_DRIFT_FIELDS.has(d.field));
-  const other = drift.filter((d) => !CRITICAL_DRIFT_FIELDS.has(d.field) && !SOURCE_DRIFT_FIELDS.has(d.field) && !RUNTIME_DRIFT_FIELDS.has(d.field));
-  return { critical, source, runtime, other };
+  const setup = drift.filter((d) => SETUP_DRIFT_FIELDS.has(d.field));
+  const other = drift.filter((d) => !CRITICAL_DRIFT_FIELDS.has(d.field) && !SOURCE_DRIFT_FIELDS.has(d.field) && !RUNTIME_DRIFT_FIELDS.has(d.field) && !SETUP_DRIFT_FIELDS.has(d.field));
+  return { critical, source, runtime, setup, other };
 }
 
 async function assertSendCompatibility() {
   const report = await getCompatibilityReport();
   if (report.approval.approvedForSending) return;
 
-  const { critical, source, runtime, other } = classifyDrift(report.approval.drift);
+  const { critical, source, runtime, setup, other } = classifyDrift(report.approval.drift);
 
   // Critical drift always blocks sending regardless of mode.
   if (critical.length > 0) {
@@ -488,20 +492,20 @@ async function assertSendCompatibility() {
   }
 
   if (POLICY_MODE === 'developer') {
-    // Developer mode: source and runtime drift are tolerated for send.
+    // Developer mode: source, runtime, and setup (missing baseline) drift are tolerated for send.
     if (other.length > 0) {
       const fields = other.map((d) => d.field).join(', ');
       throw new Error(`Sending is blocked by unclassified drift: ${fields}. Promote a new baseline.`);
     }
-    if (source.length > 0 || runtime.length > 0) {
-      log.debug('policy-developer-send', `tolerating drift: ${[...source, ...runtime].map((d) => d.field).join(', ')}`);
+    if (source.length > 0 || runtime.length > 0 || setup.length > 0) {
+      log.debug('policy-developer-send', `tolerating drift: ${[...source, ...runtime, ...setup].map((d) => d.field).join(', ')}`);
     }
     return;
   }
 
-  // Balanced mode: runtime drift alone is tolerated for send; source drift blocks.
-  if (source.length > 0 || other.length > 0) {
-    const fields = [...source, ...other].map((d) => d.field).join(', ');
+  // Balanced mode: runtime drift alone is tolerated for send; source and setup drift block.
+  if (source.length > 0 || other.length > 0 || setup.length > 0) {
+    const fields = [...source, ...other, ...setup].map((d) => d.field).join(', ');
     throw new Error(`Sending is blocked by source drift: ${fields}. Promote a new baseline.`);
   }
   if (runtime.length > 0) {
@@ -513,7 +517,7 @@ async function assertContentCompatibility() {
   const report = await getCompatibilityReport();
   if (report.approval.approvedForSending) return;
 
-  const { critical, source, runtime, other } = classifyDrift(report.approval.drift);
+  const { critical, source, runtime, setup, other } = classifyDrift(report.approval.drift);
 
   // Critical drift always blocks content regardless of mode.
   if (critical.length > 0) {
@@ -526,8 +530,7 @@ async function assertContentCompatibility() {
     throw new Error(`Chat content access is blocked by compatibility drift: ${fields}. Run the content-free self-test and explicitly promote a new baseline.`);
   }
 
-  // Balanced and developer: runtime drift alone never blocks reading.
-  // Developer: source drift also never blocks reading.
+  // Developer: source, runtime, and setup drift never block reading.
   if (POLICY_MODE === 'developer') {
     if (other.length > 0) {
       const fields = other.map((d) => d.field).join(', ');
@@ -536,9 +539,9 @@ async function assertContentCompatibility() {
     return;
   }
 
-  // Balanced: source drift blocks content, runtime drift does not.
-  if (source.length > 0 || other.length > 0) {
-    const fields = [...source, ...other].map((d) => d.field).join(', ');
+  // Balanced: source and setup drift block content, runtime drift does not.
+  if (source.length > 0 || other.length > 0 || setup.length > 0) {
+    const fields = [...source, ...other, ...setup].map((d) => d.field).join(', ');
     throw new Error(`Chat content access is blocked by source drift: ${fields}. Promote a new baseline.`);
   }
 }

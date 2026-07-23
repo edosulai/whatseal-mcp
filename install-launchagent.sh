@@ -5,8 +5,10 @@ set -euo pipefail
 
 LABEL="${WHATSAPP_LAUNCHAGENT_LABEL:-com.local.whatsapp-mcp-secure}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATE_DIR="${WHATSAPP_AGENT_STATE:-${HOME}/.local/state/whatsapp-agent}"
-ROOT_DIR="${WHATSAPP_AGENT_ROOT:-${HOME}/.local/share/whatsapp-agent}"
+BASE_STATE_DIR="${WHATSAPP_AGENT_STATE:-${HOME}/.local/state/whatsapp-agent}"
+BASE_ROOT_DIR="${WHATSAPP_AGENT_ROOT:-${HOME}/.local/share/whatsapp-agent}"
+STATE_DIR="$BASE_STATE_DIR"
+ROOT_DIR="$BASE_ROOT_DIR"
 CHROME_PATH="${WHATSAPP_CHROME_PATH:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 PLIST_DIR="${HOME}/Library/LaunchAgents"
 PLIST="${PLIST_DIR}/${LABEL}.plist"
@@ -16,13 +18,14 @@ APPROVAL_HELPER="${STATE_DIR}/native-approval"
 BASELINE_APPROVAL_HELPER="${STATE_DIR}/native-baseline-approval"
 VERBOSE=0
 ACTION="install"
+ACCOUNT_ID=""
 
 log() { printf '%s script=whatsapp-launchagent pid=%s event=%s detail=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$1" "${2:-}"; }
 vlog() { [[ "$VERBOSE" -eq 1 ]] && log "debug" "$*" || true; }
 fail() { log "error" "$*" >&2; exit 1; }
 usage() {
   cat <<'EOF'
-Usage: install-launchagent.sh [install|status|start|stop|restart|remove] [--verbose|-v]
+Usage: install-launchagent.sh [install|status|start|stop|restart|remove] [--account ID] [--verbose|-v]
 
   install   Install dependencies, render the private LaunchAgent, and start it.
   status    Show launchd, socket, and pairing status without reading messages.
@@ -30,6 +33,10 @@ Usage: install-launchagent.sh [install|status|start|stop|restart|remove] [--verb
   stop      Stop an already installed agent.
   restart   Restart an already installed agent.
   remove    Stop and remove only a LaunchAgent owned by this installer.
+
+Options:
+  --account ID   Target a specific account (e.g. alpha, beta). Without this,
+                 operates on the legacy single-account instance.
 
 Verbose mode prints every external command and decision branch.
 EOF
@@ -40,9 +47,23 @@ for arg in "$@"; do
     install|status|start|stop|restart|remove) ACTION="$arg" ;;
     -v|--verbose) VERBOSE=1 ;;
     -h|--help) usage; exit 0 ;;
-    *) fail "unknown argument: $arg" ;;
+    --account) ;; # value handled below
+    *) if [[ "${prev_arg:-}" == "--account" ]]; then ACCOUNT_ID="$arg"; else fail "unknown argument: $arg"; fi ;;
   esac
+  prev_arg="$arg"
 done
+
+# Apply account-specific paths
+if [[ -n "$ACCOUNT_ID" ]]; then
+  LABEL="${WHATSAPP_LAUNCHAGENT_LABEL:-com.local.whatsapp-mcp-secure}.${ACCOUNT_ID}"
+  STATE_DIR="${STATE_DIR}/${ACCOUNT_ID}"
+  ROOT_DIR="${ROOT_DIR}/${ACCOUNT_ID}"
+  LOG_DIR="${STATE_DIR}/logs"
+  PLIST="${PLIST_DIR}/${LABEL}.plist"
+  MARKER="${STATE_DIR}/launchagent-owned"
+  APPROVAL_HELPER="${STATE_DIR}/native-approval"
+  BASELINE_APPROVAL_HELPER="${STATE_DIR}/native-baseline-approval"
+fi
 
 NODE_BIN="$(command -v node || true)"
 NPM_BIN="$(command -v npm || true)"
@@ -107,11 +128,12 @@ render_plist() {
   <dict>
     <key>HOME</key><string>${HOME}</string>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-    <key>WHATSAPP_AGENT_STATE</key><string>${STATE_DIR}</string>
-    <key>WHATSAPP_AGENT_ROOT</key><string>${ROOT_DIR}</string>
+    <key>WHATSAPP_AGENT_STATE</key><string>${BASE_STATE_DIR}</string>
+    <key>WHATSAPP_AGENT_ROOT</key><string>${BASE_ROOT_DIR}</string>
     <key>WHATSAPP_CHROME_PATH</key><string>${CHROME_PATH}</string>
     <key>WHATSAPP_APPROVAL_HELPER</key><string>${APPROVAL_HELPER}</string>
     <key>WHATSAPP_POLICY_MODE</key><string>${WHATSAPP_POLICY_MODE:-balanced}</string>
+    <key>WHATSAPP_ACCOUNT_ID</key><string>${ACCOUNT_ID}</string>
   </dict>
   <key>Umask</key><integer>63</integer>
   <key>RunAtLoad</key><true/>

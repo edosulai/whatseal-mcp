@@ -1,20 +1,51 @@
 #!/usr/bin/env node
 import process from 'node:process';
+import { createRequire } from 'node:module';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
-import { createLogger, parseCommonArgs, rpcCall } from './lib/core.mjs';
+import { accountPaths, createLogger, parseCommonArgs, readJson, rpcCall } from './lib/core.mjs';
 
+const require = createRequire(import.meta.url);
 const { verbose, help } = parseCommonArgs(process.argv.slice(2));
 const log = createLogger('whatsapp-mcp', verbose);
 
 if (help) {
-  process.stdout.write('Usage: node mcp-server.mjs [--verbose|-v]\n\nRuns the local WhatsApp MCP bridge over stdio.\n');
+  process.stdout.write('Usage: node mcp-server.mjs [--verbose|-v]\n\nRuns the local WhatsApp MCP bridge over stdio.\nSupports multiple accounts via the account parameter.\n');
   process.exit(0);
 }
 
-const server = new McpServer({ name: 'local-whatsapp', version: '1.0.0' });
+const accountsConfig = readJson(new URL('./accounts.json', import.meta.url).pathname, { accounts: [], default: null });
+let accounts = null;
+
+async function getAccounts() {
+  if (accounts) return accounts;
+  accounts = await accountsConfig;
+  return accounts;
+}
+
+async function resolveSocketPath(accountParam) {
+  const config = await getAccounts();
+  const id = accountParam || config.default || null;
+  if (!id && config.accounts.length === 0) {
+    // Legacy single-account fallback
+    return accountPaths(null).socket;
+  }
+  if (!id && config.accounts.length > 0) {
+    return accountPaths(config.accounts[0].id).socket;
+  }
+  const match = config.accounts.find((a) => a.id === id || a.alias === id);
+  if (!match) throw new Error(`Unknown account: ${id}. Available: ${config.accounts.map((a) => `${a.id} (${a.alias})`).join(', ')}`);
+  return accountPaths(match.id).socket;
+}
+
+async function routedRpcCall(method, params, { timeoutMs = 30000, account = null } = {}) {
+  const socketPath = await resolveSocketPath(account);
+  return rpcCall(method, params, { timeoutMs, socketPath });
+}
+
+const server = new McpServer({ name: 'local-whatsapp', version: '2.0.0' });
 
 function response(result) {
   return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
@@ -26,10 +57,13 @@ function failure(error) {
 }
 
 function register(name, config, method, timeoutMs = 30000) {
-  server.registerTool(name, config, async (params) => {
+  // Inject optional account param into every tool's input schema
+  const schema = { account: z.string().optional().describe('Account ID or alias. Omit to use the default account.'), ...config.inputSchema };
+  server.registerTool(name, { ...config, inputSchema: schema }, async (params) => {
     try {
-      log.debug('tool-call', name);
-      return response(await rpcCall(method, params, { timeoutMs }));
+      const { account, ...rest } = params;
+      log.debug('tool-call', `${name} account=${account || 'default'}`);
+      return response(await routedRpcCall(method, rest, { timeoutMs, account }));
     } catch (error) {
       return failure(error);
     }
@@ -41,6 +75,27 @@ register('whatsapp_status', {
   inputSchema: {},
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, 'status', 5000);
+
+server.registerTool('whatsapp_list_accounts', {
+  description: 'List all configured WhatsApp accounts with their IDs, aliases, and connection status. Use this to discover available accounts before specifying an account parameter.',
+  inputSchema: {},
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+}, async () => {
+  try {
+    const config = await getAccounts();
+    const statuses = await Promise.all(config.accounts.map(async (a) => {
+      try {
+        const status = await routedRpcCall('status', {}, { timeoutMs: 3000, account: a.id });
+        return { ...a, phase: status.phase, ready: status.ready, policyMode: status.policyMode };
+      } catch {
+        return { ...a, phase: 'unreachable', ready: false, policyMode: null };
+      }
+    }));
+    return response({ default: config.default, accounts: statuses });
+  } catch (error) {
+    return failure(error);
+  }
+});
 
 register('whatsapp_compatibility', {
   description: 'Return the local WhatsApp backend compatibility report: current WhatsApp Web, browser, Node, pinned dependency versions, and enabled security controls. This does not read chats or messages.',
