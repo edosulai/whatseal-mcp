@@ -1,9 +1,9 @@
 {
-  "name": "local-whatsapp-agent",
-  "version": "1.0.0",
+  "name": "whatseal-mcp",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Local, isolated WhatsApp Web backend for agent-assisted inbox triage",
+  "description": "Sealed WhatsApp MCP — biometric (Touch ID) approval for every externally visible action",
   "engines": {
     "node": ">=22"
   },

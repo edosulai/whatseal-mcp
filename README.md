@@ -1,7 +1,12 @@
-# Local WhatsApp Agent Backend
+# whatseal-mcp
 
-This directory provides an isolated, background-only WhatsApp Web linked device
-for local agent-assisted inbox triage.
+**Sealed WhatsApp MCP** — every message is sealed until you approve it with
+Touch ID or your macOS login password.
+
+This is an isolated, background-only WhatsApp Web linked device exposed to AI
+agents via the Model Context Protocol (MCP). Reading chats is free; every
+externally visible action (send, reaction, mark-read) requires a physical
+biometric approval.
 
 ## Security and support boundary
 

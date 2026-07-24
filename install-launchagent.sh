@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-LABEL="${WHATSAPP_LAUNCHAGENT_LABEL:-com.local.whatsapp-mcp-secure}"
+LABEL="${WHATSAPP_LAUNCHAGENT_LABEL:-com.local.whatseal-mcp}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_STATE_DIR="${WHATSAPP_AGENT_STATE:-${HOME}/.local/state/whatsapp-agent}"
 BASE_ROOT_DIR="${WHATSAPP_AGENT_ROOT:-${HOME}/.local/share/whatsapp-agent}"
