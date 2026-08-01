@@ -34,6 +34,19 @@ const accountFromCli = accountArgIdx !== -1 ? process.argv[accountArgIdx + 1] : 
 const accountId = accountFromCli || process.env.WHATSAPP_ACCOUNT_ID || null;
 const paths = accountPaths(accountId);
 
+function resolveHttpPort(id = null) {
+  const fromEnv = Number(process.env.WHATSAPP_HTTP_PORT || 0);
+  if (Number.isInteger(fromEnv) && fromEnv > 0) return fromEnv;
+  if (!id) return 5001;
+  const known = { 'beta': 5001, 'alpha': 5002 };
+  if (known[id]) return known[id];
+  let hash = 0;
+  for (let i = 0; i < id.length; i += 1) {
+    hash = ((hash * 33) + id.charCodeAt(i)) % 90;
+  }
+  return 5010 + hash;
+}
+
 process.umask(0o077);
 
 const { Client, LocalAuth, Location, MessageMedia } = whatsapp;
@@ -1650,13 +1663,15 @@ async function main() {
     }
   });
 
-  const HTTP_PORT = 5001;
+  // Multi-account: each daemon needs its own localhost HTTP port.
+  // beta stays on 5001 (web UI default). alpha uses 5002. Others get a stable offset.
+  const HTTP_PORT = resolveHttpPort(accountId);
   httpServer = http.createServer(app);
   await new Promise((resolve, reject) => {
     httpServer.once('error', reject);
     httpServer.listen(HTTP_PORT, '127.0.0.1', resolve);
   });
-  log.info('http-api-ready', `port=${HTTP_PORT} url=http://localhost:${HTTP_PORT}`);
+  log.info('http-api-ready', `account=${accountId || 'default'} port=${HTTP_PORT} url=http://localhost:${HTTP_PORT}`);
 
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));

@@ -54,6 +54,7 @@ for arg in "$@"; do
 done
 
 # Apply account-specific paths
+HTTP_PORT="${WHATSAPP_HTTP_PORT:-}"
 if [[ -n "$ACCOUNT_ID" ]]; then
   LABEL="${WHATSAPP_LAUNCHAGENT_LABEL:-com.local.whatseal-mcp}.${ACCOUNT_ID}"
   STATE_DIR="${STATE_DIR}/${ACCOUNT_ID}"
@@ -63,6 +64,15 @@ if [[ -n "$ACCOUNT_ID" ]]; then
   MARKER="${STATE_DIR}/launchagent-owned"
   APPROVAL_HELPER="${STATE_DIR}/native-approval"
   BASELINE_APPROVAL_HELPER="${STATE_DIR}/native-baseline-approval"
+  if [[ -z "$HTTP_PORT" ]]; then
+    case "$ACCOUNT_ID" in
+      beta) HTTP_PORT=5001 ;;
+      alpha) HTTP_PORT=5002 ;;
+      *) HTTP_PORT=$((5010 + $(printf '%s' "$ACCOUNT_ID" | cksum | awk '{print $1 % 90}'))) ;;
+    esac
+  fi
+else
+  HTTP_PORT="${HTTP_PORT:-5001}"
 fi
 
 NODE_BIN="$(command -v node || true)"
@@ -133,6 +143,7 @@ $(if [[ -n "$ACCOUNT_ID" ]]; then printf '    <string>--account</string>\n    <s
     <key>WHATSAPP_CHROME_PATH</key><string>${CHROME_PATH}</string>
     <key>WHATSAPP_APPROVAL_HELPER</key><string>${APPROVAL_HELPER}</string>
     <key>WHATSAPP_ACCOUNT_ID</key><string>${ACCOUNT_ID}</string>
+    <key>WHATSAPP_HTTP_PORT</key><string>${HTTP_PORT}</string>
   </dict>
   <key>Umask</key><integer>63</integer>
   <key>RunAtLoad</key><true/>
