@@ -1492,10 +1492,58 @@ async function main() {
         timestamp: msg.timestamp,
         status: msg.ack >= 2 ? 'read' : msg.ack === 1 ? 'delivered' : 'sent',
         id: msg.id,
-        type: msg.type
+        type: msg.type,
+        hasMedia: msg.hasMedia || false,
+        mediaUrl: msg.hasMedia ? `/api/media/${encodeURIComponent(msg.id)}` : null
       }));
       res.json(transformed);
     } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/media/:messageId - serve media (stickers, images, etc)
+  app.get('/api/media/:messageId', async (req, res) => {
+    try {
+      if (phase !== 'ready') return res.status(503).json({ error: 'WhatsApp not ready' });
+      const { messageId } = req.params;
+      const decodedId = decodeURIComponent(messageId);
+      
+      // Extract chatId from messageId (format: true/false_chatId_msgId)
+      const parts = decodedId.split('_');
+      if (parts.length < 2) {
+        return res.status(400).json({ error: 'Invalid message ID format' });
+      }
+      const chatId = parts[1];
+      
+      // Get chat and find message
+      const chat = await client.getChatById(chatId);
+      if (!chat) {
+        return res.status(404).json({ error: 'Chat not found' });
+      }
+      
+      const messages = await chat.fetchMessages({ limit: 100 });
+      const message = messages.find(m => m.id._serialized === decodedId);
+      
+      if (!message) {
+        return res.status(404).json({ error: 'Message not found' });
+      }
+      
+      if (!message.hasMedia) {
+        return res.status(404).json({ error: 'Message has no media' });
+      }
+      
+      const media = await message.downloadMedia();
+      if (!media) {
+        return res.status(404).json({ error: 'Failed to download media' });
+      }
+      
+      const buffer = Buffer.from(media.data, 'base64');
+      res.setHeader('Content-Type', media.mimetype);
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.send(buffer);
+    } catch (err) {
+      log.error('media-download-error', err.message);
       res.status(500).json({ error: err.message });
     }
   });

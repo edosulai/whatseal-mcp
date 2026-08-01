@@ -203,6 +203,46 @@
     object-fit: cover;
 }
 
+/* Sticker styles */
+.chat__sticker-wrapper {
+    background: transparent !important;
+    box-shadow: none !important;
+    padding: 4px !important;
+}
+
+.chat__sticker-wrapper::before {
+    display: none !important;
+}
+
+.chat__sticker {
+    width: 150px;
+    height: 150px;
+    object-fit: contain;
+}
+
+.chat__video {
+    max-width: 100%;
+    max-height: 300px;
+    border-radius: 4px;
+}
+
+.chat__audio {
+    width: 100%;
+    min-width: 200px;
+}
+
+.chat__document {
+    display: block;
+    padding: 10px;
+    color: #00a5cf;
+    text-decoration: none;
+}
+
+.chat__img-caption {
+    margin-top: 5px;
+    font-size: 0.9rem;
+}
+
 .chat__msg-filler {
     width: 65px;
     display: inline-block;

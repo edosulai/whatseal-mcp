@@ -107,7 +107,10 @@ const UsersProvider = ({ children }) => {
 						sender: msg.sender,
 						time: msg.time,
 						status: msg.status,
-						id: msg.id
+						id: msg.id,
+						type: msg.type,
+						hasMedia: msg.hasMedia,
+						mediaUrl: msg.mediaUrl
 					});
 				});
 				usersCopy[userIndex].messages = grouped;
