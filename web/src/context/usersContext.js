@@ -69,17 +69,6 @@ const UsersProvider = ({ children }) => {
 		};
 	}, [loadChats]);
 
-	// Poll active chat messages more frequently
-	useEffect(() => {
-		if (!activeChat) return;
-		
-		const msgPollInterval = setInterval(() => {
-			loadMessages(activeChat);
-		}, 3000);
-
-		return () => clearInterval(msgPollInterval);
-	}, [activeChat]);
-
 	const _updateUserProp = (userId, prop, value) => {
 		setUsers((users) => {
 			const usersCopy = [...users];
@@ -101,7 +90,8 @@ const UsersProvider = ({ children }) => {
 		_updateUserProp(userId, "typing", false);
 	};
 
-	const loadMessages = async (userId) => {
+	const loadMessages = useCallback(async (userId) => {
+		if (!userId) return;
 		try {
 			const messages = await api.fetchMessages(userId);
 			setUsers((users) => {
@@ -126,13 +116,25 @@ const UsersProvider = ({ children }) => {
 		} catch (err) {
 			console.error('Failed to load messages:', err);
 		}
-	};
+	}, [api]);
+
+	// Poll active chat messages more frequently
+	useEffect(() => {
+		if (!activeChat) return;
+		
+		// Load immediately when chat changes
+		loadMessages(activeChat);
+		
+		const msgPollInterval = setInterval(() => {
+			loadMessages(activeChat);
+		}, 2000); // Poll every 2 seconds
+
+		return () => clearInterval(msgPollInterval);
+	}, [activeChat, loadMessages]);
 
 	const setUserAsUnread = (userId) => {
 		_updateUserProp(userId, "unread", 0);
 		setActiveChat(userId);
-		// Load messages when chat is opened
-		loadMessages(userId);
 	};
 
 	const addNewMessage = async (userId, message) => {
