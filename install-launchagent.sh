@@ -123,7 +123,7 @@ render_plist() {
   <array>
     <string>${NODE_BIN}</string>
     <string>${SCRIPT_DIR}/daemon.mjs</string>
-  </array>
+$(if [[ -n "$ACCOUNT_ID" ]]; then printf '    <string>--account</string>\n    <string>%s</string>\n' "$ACCOUNT_ID"; fi)  </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key><string>${HOME}</string>

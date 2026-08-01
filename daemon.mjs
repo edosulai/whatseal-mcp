@@ -26,9 +26,12 @@ import {
   writeJsonAtomic,
 } from './lib/core.mjs';
 
-// Parse --account argument and compute paths
+// Prefer CLI --account, then WHATSAPP_ACCOUNT_ID from LaunchAgent/env.
+// LaunchAgent historically only set the env var (no CLI flag); without this fallback
+// the daemon bound the legacy root paths and ignored per-account auth/state.
 const accountArgIdx = process.argv.indexOf('--account');
-const accountId = accountArgIdx !== -1 ? process.argv[accountArgIdx + 1] : null;
+const accountFromCli = accountArgIdx !== -1 ? process.argv[accountArgIdx + 1] : null;
+const accountId = accountFromCli || process.env.WHATSAPP_ACCOUNT_ID || null;
 const paths = accountPaths(accountId);
 
 process.umask(0o077);
@@ -1508,6 +1511,7 @@ async function main() {
       if (phase !== 'ready') return res.status(503).json({ error: 'WhatsApp not ready' });
       const { messageId } = req.params;
       const decodedId = decodeURIComponent(messageId);
+      log.info('media-request', `messageId=${decodedId}`);
       
       // Extract chatId from messageId (format: true/false_chatId_msgId)
       const parts = decodedId.split('_');
@@ -1516,34 +1520,104 @@ async function main() {
       }
       const chatId = parts[1];
       
-      // Get chat and find message
-      const chat = await client.getChatById(chatId);
-      if (!chat) {
-        return res.status(404).json({ error: 'Chat not found' });
+      // Download media directly via puppeteer using WWebJS pattern
+      const mediaData = await client.pupPage.evaluate(async (targetChatId, targetMsgId) => {
+        try {
+          const chat = await window.WWebJS.getChat(targetChatId, { getAsModel: false });
+          if (!chat) return { error: 'Chat not found' };
+          
+          const messages = chat.msgs?.getModelsArray?.() || [];
+          const serialized = (v) => v?._serialized ?? v?.$1 ?? String(v || '');
+          const msg = messages.find(m => serialized(m.id) === targetMsgId);
+          
+          if (!msg) return { error: 'Message not found' };
+          
+          const isMedia = Boolean(msg.mediaData || msg.isMedia) || 
+                          ['image', 'video', 'audio', 'ptt', 'sticker', 'document'].includes(msg.type);
+          if (!isMedia) return { error: 'Message has no media' };
+          
+          // Helper to convert ArrayBuffer to base64
+          const arrayBufferToBase64 = (buffer) => {
+            const arr = new Uint8Array(buffer);
+            let b64 = '';
+            const chunk = 8192;
+            for (let i = 0; i < arr.length; i += chunk) {
+              b64 += String.fromCharCode.apply(null, arr.subarray(i, i + chunk));
+            }
+            return btoa(b64);
+          };
+          
+          // Try using MsgInfoStore/MsgStore to download
+          if (window.Store?.MsgLoad?.downloadMedia) {
+            try {
+              await window.Store.MsgLoad.downloadMedia(msg);
+              if (msg.mediaData?.mediaBlob) {
+                const blob = msg.mediaData.mediaBlob;
+                return { ok: true, mimetype: msg.mimetype || 'image/webp', data: arrayBufferToBase64(await blob.arrayBuffer()) };
+              }
+            } catch(e) { /* continue */ }
+          }
+          
+          // Try direct download using decryptAndDownload
+          if (msg.mediaData && typeof msg.mediaData.decryptAndDownload === 'function') {
+            try {
+              await msg.mediaData.decryptAndDownload();
+              if (msg.mediaData.mediaBlob) {
+                const blob = msg.mediaData.mediaBlob;
+                return { ok: true, mimetype: msg.mimetype || 'image/webp', data: arrayBufferToBase64(await blob.arrayBuffer()) };
+              }
+            } catch(e) { /* continue */ }
+          }
+
+          // Try using DownloadManager
+          if (window.Store?.DownloadManager?.downloadAndDecrypt) {
+            try {
+              const result = await window.Store.DownloadManager.downloadAndDecrypt({
+                directPath: msg.directPath,
+                encFilehash: msg.encFilehash,
+                filehash: msg.filehash,
+                mediaKey: msg.mediaKey,
+                mediaKeyTimestamp: msg.mediaKeyTimestamp,
+                type: msg.type,
+                signal: (new AbortController()).signal
+              });
+              if (result) {
+                return { ok: true, mimetype: msg.mimetype || 'image/webp', data: arrayBufferToBase64(result) };
+              }
+            } catch(e) { /* continue */ }
+          }
+          
+          // Try simple fetch from deprecatedMms3Url 
+          const mediaUrl = msg.deprecatedMms3Url || msg.clientUrl;
+          if (mediaUrl) {
+            try {
+              const response = await fetch(mediaUrl);
+              if (response.ok) {
+                const blob = await response.blob();
+                return { ok: true, mimetype: msg.mimetype || blob.type || 'image/webp', data: arrayBufferToBase64(await blob.arrayBuffer()) };
+              }
+            } catch(e) { /* continue */ }
+          }
+          
+          return { error: 'Could not download media - all methods failed' };
+        } catch (e) {
+          return { error: e.message || String(e) };
+        }
+      }, chatId, decodedId);
+      
+      if (mediaData.error) {
+        log.error('media-download-error', mediaData.error);
+        return res.status(404).json({ error: mediaData.error });
       }
       
-      const messages = await chat.fetchMessages({ limit: 100 });
-      const message = messages.find(m => m.id._serialized === decodedId);
+      log.info('media-download-complete', `mimetype=${mediaData.mimetype} dataLen=${mediaData.data?.length}`);
       
-      if (!message) {
-        return res.status(404).json({ error: 'Message not found' });
-      }
-      
-      if (!message.hasMedia) {
-        return res.status(404).json({ error: 'Message has no media' });
-      }
-      
-      const media = await message.downloadMedia();
-      if (!media) {
-        return res.status(404).json({ error: 'Failed to download media' });
-      }
-      
-      const buffer = Buffer.from(media.data, 'base64');
-      res.setHeader('Content-Type', media.mimetype);
+      const buffer = Buffer.from(mediaData.data, 'base64');
+      res.setHeader('Content-Type', mediaData.mimetype);
       res.setHeader('Cache-Control', 'public, max-age=86400');
       res.send(buffer);
     } catch (err) {
-      log.error('media-download-error', err.message);
+      log.error('media-download-error', `${err.message} stack=${err.stack?.split('\n')[1]}`);
       res.status(500).json({ error: err.message });
     }
   });
