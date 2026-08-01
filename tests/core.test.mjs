@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { DraftStore, serializeChat, serializeMessage, truncateText } from '../lib/core.mjs';
+import {
+  DraftStore,
+  buildReadinessGuidance,
+  classifyRpcError,
+  resolveAccountRecord,
+  serializeChat,
+  serializeMessage,
+  truncateText,
+} from '../lib/core.mjs';
 
 test('truncateText enforces the requested maximum', () => {
   assert.equal(truncateText('abc', 3), 'abc');
@@ -80,4 +88,49 @@ test('draft store bounds pending approvals', () => {
   const store = new DraftStore({ maximum: 1 });
   store.prepare({ chatId: '1@c.us', chatName: 'One', text: 'First' });
   assert.throws(() => store.prepare({ chatId: '2@c.us', chatName: 'Two', text: 'Second' }));
+});
+
+test('resolveAccountRecord accepts id or alias and rejects unknown accounts', () => {
+  const config = {
+    default: 'alpha',
+    accounts: [
+      { id: 'alpha', alias: 'work', description: 'Primary' },
+      { id: 'beta', alias: 'test', description: 'Secondary' },
+    ],
+  };
+  assert.equal(resolveAccountRecord(config, null).id, 'alpha');
+  assert.equal(resolveAccountRecord(config, 'test').id, 'alpha');
+  assert.throws(() => resolveAccountRecord(config, 'missing'), /Unknown account/);
+});
+
+test('readiness guidance for stopped backend is actionable', () => {
+  const guidance = buildReadinessGuidance({
+    accountId: 'alpha',
+    alias: 'work',
+    phase: 'stopped',
+    ready: false,
+    projectRoot: '/tmp/whatseal-mcp',
+    code: 'BACKEND_UNAVAILABLE',
+  });
+  assert.equal(guidance.ready, false);
+  assert.equal(guidance.code, 'BACKEND_UNAVAILABLE');
+  assert.match(guidance.userMessage, /not running|stopped/i);
+  assert.ok(guidance.commands.start.includes('--account alpha'));
+  assert.ok(guidance.agentNextSteps.length > 0);
+});
+
+test('classifyRpcError maps not-ready and socket failures', () => {
+  const notReady = classifyRpcError(
+    new Error('WhatsApp backend is not ready (phase=pairing). Pair the linked device first.'),
+    { accountId: 'alpha', alias: 'work', projectRoot: '/tmp/whatseal-mcp' },
+  );
+  assert.equal(notReady.code, 'NEEDS_PAIRING');
+  assert.equal(notReady.ready, false);
+
+  const unavailable = classifyRpcError(
+    new Error('WhatsApp backend unavailable: connect ENOENT /tmp/control.sock'),
+    { accountId: 'alpha', alias: 'work', projectRoot: '/tmp/whatseal-mcp', savedState: { phase: 'ready' } },
+  );
+  assert.equal(unavailable.code, 'BACKEND_UNAVAILABLE');
+  assert.match(unavailable.commands.install, /install-launchagent\.sh install --account alpha/);
 });

@@ -8,21 +8,28 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import net from 'node:net';
+import http from 'node:http';
 import process from 'node:process';
 import QRCode from 'qrcode';
 import whatsapp from 'whatsapp-web.js';
+import express from 'express';
 
 import {
+  accountPaths,
   createLogger,
   DraftStore,
   ensurePrivateDirectories,
   parseCommonArgs,
-  paths,
   readJson,
   truncateText,
   writeFileAtomic,
   writeJsonAtomic,
 } from './lib/core.mjs';
+
+// Parse --account argument and compute paths
+const accountArgIdx = process.argv.indexOf('--account');
+const accountId = accountArgIdx !== -1 ? process.argv[accountArgIdx + 1] : null;
+const paths = accountPaths(accountId);
 
 process.umask(0o077);
 
@@ -83,6 +90,7 @@ let qrUpdatedAt = null;
 let readyAt = null;
 let shuttingDown = false;
 let server;
+let httpServer;
 let qrGeneration = 0;
 let stateWriteQueue = Promise.resolve();
 let authenticatedRecoveryTimer = null;
@@ -1020,6 +1028,31 @@ async function dispatch(method, params = {}) {
     return await getMessageStatusDirect(messageId);
   }
 
+  // Direct send without approval - for trusted web UI only
+  if (method === 'directSend') {
+    assertSendRateLimit();
+    const text = String(params.text || '').trim();
+    if (!text) throw new Error('Message text cannot be empty.');
+    if (text.length > 10000) throw new Error('Message text exceeds the 10,000-character safety limit.');
+    const chat = await resolveChat(params.chat);
+    const sent = await client.sendMessage(chat.id, text, {
+      sendSeen: false,
+      waitUntilMsgSent: true,
+    });
+    await client.sendPresenceUnavailable().catch(() => {});
+    return sent
+      ? {
+          success: true,
+          message: {
+            id: sent.id?._serialized || '',
+            timestamp: Number(sent.timestamp || 0),
+            ack: Number(sent.ack ?? 0),
+            type: sent.type || 'chat',
+          },
+        }
+      : { success: true, message: null, detail: 'Message sent but no confirmation object returned.' };
+  }
+
   if (method === 'prepareSend') {
     assertSendRateLimit();
     const text = String(params.text || '').trim();
@@ -1293,6 +1326,10 @@ async function shutdown(signal, exitCode = 0) {
     new Promise((resolve) => server?.close(resolve) || resolve()),
     new Promise((resolve) => setTimeout(resolve, 3000)),
   ]);
+  await Promise.race([
+    new Promise((resolve) => httpServer?.close(resolve) || resolve()),
+    new Promise((resolve) => setTimeout(resolve, 2000)),
+  ]);
   await client.destroy().catch(() => {});
   await rm(paths.socket, { force: true });
   await removeQr();
@@ -1342,6 +1379,127 @@ async function main() {
   await chmod(paths.socket, 0o600);
   await publishState();
   log.info('control-socket-ready', `path=${paths.socket}`);
+
+  // Start HTTP API server for Web UI (no fingerprint required)
+  const app = express();
+  app.use(express.json());
+  
+  // CORS for local dev
+  app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
+  });
+
+  // GET /api/status
+  app.get('/api/status', async (req, res) => {
+    try {
+      res.json({ ok: true, result: { phase, ready: phase === 'ready', connectionState } });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // GET /api/me - get current WhatsApp user info
+  app.get('/api/me', async (req, res) => {
+    try {
+      if (phase !== 'ready') return res.status(503).json({ error: 'WhatsApp not ready' });
+      const info = client.info;
+      res.json({
+        ok: true,
+        result: {
+          wid: info?.wid?._serialized || null,
+          pushname: info?.pushname || null,
+          phone: info?.wid?.user || null,
+          platform: info?.platform || null
+        }
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // GET /api/chats
+  app.get('/api/chats', async (req, res) => {
+    try {
+      if (phase !== 'ready') return res.status(503).json({ error: 'WhatsApp not ready' });
+      const chats = await getChatSummaries({ includeLastMessage: true });
+      const transformed = chats.map(chat => ({
+        id: chat.id,
+        name: chat.name || chat.id,
+        profile_picture: null,
+        unread: chat.unreadCount || 0,
+        lastMessage: chat.lastMessage?.body || '',
+        timestamp: chat.timestamp || Date.now(),
+        typing: false,
+        isGroup: chat.isGroup,
+        messages: { TODAY: [] }
+      }));
+      res.json(transformed);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/messages/:chatId
+  app.get('/api/messages/:chatId', async (req, res) => {
+    try {
+      if (phase !== 'ready') return res.status(503).json({ error: 'WhatsApp not ready' });
+      const { chatId } = req.params;
+      const limit = Math.min(Number(req.query.limit) || 50, 100);
+      const messages = await getMessagesDirect(chatId, limit);
+      const transformed = messages.map(msg => ({
+        content: msg.body,
+        sender: msg.fromMe ? null : chatId,
+        time: new Date(msg.timestamp * 1000).toLocaleTimeString(),
+        timestamp: msg.timestamp,
+        status: msg.ack >= 2 ? 'read' : msg.ack === 1 ? 'delivered' : 'sent',
+        id: msg.id,
+        type: msg.type
+      }));
+      res.json(transformed);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/send - Direct send without fingerprint (Web UI only)
+  app.post('/api/send', async (req, res) => {
+    try {
+      if (phase !== 'ready') return res.status(503).json({ error: 'WhatsApp not ready' });
+      const { chatId, text } = req.body;
+      if (!chatId || !text) return res.status(400).json({ error: 'chatId and text required' });
+      
+      assertSendRateLimit();
+      const chat = await resolveChat(chatId);
+      const sent = await client.sendMessage(chat.id, text, {
+        sendSeen: false,
+        waitUntilMsgSent: true,
+      });
+      await client.sendPresenceUnavailable().catch(() => {});
+      
+      res.json({
+        success: true,
+        message: sent ? {
+          id: sent.id?._serialized || '',
+          timestamp: Number(sent.timestamp || 0),
+          ack: Number(sent.ack ?? 0),
+        } : null
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  const HTTP_PORT = 5001;
+  httpServer = http.createServer(app);
+  await new Promise((resolve, reject) => {
+    httpServer.once('error', reject);
+    httpServer.listen(HTTP_PORT, '127.0.0.1', resolve);
+  });
+  log.info('http-api-ready', `port=${HTTP_PORT} url=http://localhost:${HTTP_PORT}`);
 
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));

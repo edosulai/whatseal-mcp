@@ -10,11 +10,15 @@
   "scripts": {
     "daemon": "node daemon.mjs",
     "mcp": "node mcp-server.mjs",
+    "web": "cd web && NODE_OPTIONS=--openssl-legacy-provider npm start",
+    "web:build": "cd web && NODE_OPTIONS=--openssl-legacy-provider npm run build",
+    "web:install": "cd web && npm install",
     "test": "node --test tests/*.test.mjs",
     "check": "node --check daemon.mjs && node --check cli.mjs && node --check mcp-server.mjs && node --check approve-baseline.mjs && node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
+    "express": "^4.22.2",
     "qrcode": "1.5.4",
     "whatsapp-web.js": "git+https://github.com/wwebjs/whatsapp-web.js.git#1780711a1c86dfeca7c5ba6a66f950eac93dde28",
     "zod": "4.4.3"

@@ -55,7 +55,7 @@ done
 
 # Apply account-specific paths
 if [[ -n "$ACCOUNT_ID" ]]; then
-  LABEL="${WHATSAPP_LAUNCHAGENT_LABEL:-com.local.whatsapp-mcp-secure}.${ACCOUNT_ID}"
+  LABEL="${WHATSAPP_LAUNCHAGENT_LABEL:-com.local.whatseal-mcp}.${ACCOUNT_ID}"
   STATE_DIR="${STATE_DIR}/${ACCOUNT_ID}"
   ROOT_DIR="${ROOT_DIR}/${ACCOUNT_ID}"
   LOG_DIR="${STATE_DIR}/logs"

@@ -1,99 +1,365 @@
 #!/usr/bin/env node
 import process from 'node:process';
+import { access } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
-import { accountPaths, createLogger, parseCommonArgs, readJson, rpcCall } from './lib/core.mjs';
+import {
+  buildReadinessGuidance,
+  classifyRpcError,
+  createLogger,
+  parseCommonArgs,
+  readAccountStatus,
+  readJson,
+  resolveAccountRecord,
+  rpcCall,
+} from './lib/core.mjs';
 
 const require = createRequire(import.meta.url);
 const { verbose, help } = parseCommonArgs(process.argv.slice(2));
-const log = createLogger('whatsapp-mcp', verbose);
+const log = createLogger('whatseal-mcp', verbose);
+const PROJECT_ROOT = path.dirname(fileURLToPath(import.meta.url));
+const PACKAGE = require('./package.json');
+
+const MCP_INSTRUCTIONS = `whatseal-mcp — sealed WhatsApp for local AI agents.
+
+Before ANY WhatsApp content or send action:
+1. Call whatsapp_list_accounts or whatsapp_doctor (preferred first call in a new chat).
+2. If ready=false, explain userMessage to the user and follow agentNextSteps. Do NOT invent chats/messages.
+3. If code=BACKEND_UNAVAILABLE or BACKEND_STOPPED: ask permission, then have the user run the provided start/install command (or confirm before any shell start).
+4. If code=NEEDS_PAIRING: call whatsapp_qr, show the local PNG path, tell user to scan via WhatsApp → Settings → Linked Devices → Link a Device. Poll whatsapp_wait_ready.
+5. Reads (list/read/search) never need Touch ID.
+6. Sends/reactions/mark-read are two-phase ONLY:
+   prepare_* → show exact target+preview to the user → wait for explicit OK in chat → whatsapp_request_local_approval (Touch ID / macOS password).
+7. On approval timeout or uncertainty: whatsapp_send_outcome first; never re-prepare a duplicate send blindly.
+8. Optional account param accepts id or alias from accounts.json. Omit account to use default.
+
+Never claim a message was sent unless request_local_approval / send_outcome reports success.`;
 
 if (help) {
-  process.stdout.write('Usage: node mcp-server.mjs [--verbose|-v]\n\nRuns the local WhatsApp MCP bridge over stdio.\nSupports multiple accounts via the account parameter.\n');
+  process.stdout.write('Usage: node mcp-server.mjs [--verbose|-v]\n\nRuns the local whatseal WhatsApp MCP bridge over stdio.\nSupports multiple accounts via the account parameter.\n');
   process.exit(0);
 }
 
-const accountsConfig = readJson(new URL('./accounts.json', import.meta.url).pathname, { accounts: [], default: null });
-let accounts = null;
+const accountsConfigPromise = readJson(new URL('./accounts.json', import.meta.url).pathname, { accounts: [], default: null });
+let accountsCache = null;
 
 async function getAccounts() {
-  if (accounts) return accounts;
-  accounts = await accountsConfig;
-  return accounts;
+  if (accountsCache) return accountsCache;
+  accountsCache = await accountsConfigPromise;
+  return accountsCache;
 }
 
-async function resolveSocketPath(accountParam) {
+async function resolveAccount(accountParam) {
   const config = await getAccounts();
-  const id = accountParam || config.default || null;
-  if (!id && config.accounts.length === 0) {
-    // Legacy single-account fallback
-    return accountPaths(null).socket;
-  }
-  if (!id && config.accounts.length > 0) {
-    return accountPaths(config.accounts[0].id).socket;
-  }
-  const match = config.accounts.find((a) => a.id === id || a.alias === id);
-  if (!match) throw new Error(`Unknown account: ${id}. Available: ${config.accounts.map((a) => `${a.id} (${a.alias})`).join(', ')}`);
-  return accountPaths(match.id).socket;
+  return resolveAccountRecord(config, accountParam || null);
 }
 
 async function routedRpcCall(method, params, { timeoutMs = 30000, account = null } = {}) {
-  const socketPath = await resolveSocketPath(account);
-  return rpcCall(method, params, { timeoutMs, socketPath });
+  const { paths: accountPathSet } = await resolveAccount(account);
+  return rpcCall(method, params, { timeoutMs, socketPath: accountPathSet.socket });
 }
-
-const server = new McpServer({ name: 'local-whatsapp', version: '2.0.0' });
 
 function response(result) {
   return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
 }
 
-function failure(error) {
-  log.error('tool-failed', error.message);
-  return { isError: true, content: [{ type: 'text', text: error.message }] };
+function failure(error, extras = {}) {
+  const message = error?.message || String(error);
+  log.error('tool-failed', message);
+  const payload = extras && Object.keys(extras).length > 0
+    ? { error: message, ...extras }
+    : message;
+  return {
+    isError: true,
+    content: [{ type: 'text', text: typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2) }],
+  };
 }
 
+async function failureFromRpc(error, accountParam = null) {
+  try {
+    const { id, record, paths: accountPathSet } = await resolveAccount(accountParam);
+    const savedState = await readJson(accountPathSet.stateFile, {});
+    const guidance = classifyRpcError(error, {
+      accountId: id,
+      alias: record?.alias || null,
+      paths: accountPathSet,
+      savedState,
+      projectRoot: PROJECT_ROOT,
+    });
+    return failure(error, guidance);
+  } catch (resolveError) {
+    if (resolveError?.code === 'UNKNOWN_ACCOUNT' || /Unknown account:/.test(resolveError.message)) {
+      const guidance = classifyRpcError(resolveError, { projectRoot: PROJECT_ROOT });
+      return failure(resolveError, guidance);
+    }
+    return failure(error);
+  }
+}
+
+function enrichStatus(accountMeta, status) {
+  const guidance = buildReadinessGuidance({
+    accountId: accountMeta.id,
+    alias: accountMeta.record?.alias || null,
+    phase: status.phase,
+    ready: Boolean(status.ready),
+    qrAvailable: Boolean(status.qrAvailable),
+    qrPath: status.qrPath || null,
+    projectRoot: PROJECT_ROOT,
+    backendError: status.error || null,
+    code: status.ready ? 'READY' : (status.error ? 'BACKEND_UNAVAILABLE' : null),
+  });
+  return {
+    account: accountMeta.id,
+    alias: accountMeta.record?.alias || null,
+    description: accountMeta.record?.description || null,
+    ...status,
+    ...guidance,
+    phase: status.phase || guidance.phase,
+    ready: Boolean(status.ready),
+    qrAvailable: Boolean(status.qrAvailable),
+    qrPath: status.qrPath || guidance.qrPath || null,
+  };
+}
+
+const server = new McpServer(
+  { name: 'whatseal-mcp', version: PACKAGE.version || '2.0.0' },
+  { instructions: MCP_INSTRUCTIONS },
+);
+
 function register(name, config, method, timeoutMs = 30000) {
-  // Inject optional account param into every tool's input schema
-  const schema = { account: z.string().optional().describe('Account ID or alias. Omit to use the default account.'), ...config.inputSchema };
+  const schema = {
+    account: z.string().optional().describe('Account ID or alias. Omit to use the default account.'),
+    ...config.inputSchema,
+  };
   server.registerTool(name, { ...config, inputSchema: schema }, async (params) => {
     try {
       const { account, ...rest } = params;
       log.debug('tool-call', `${name} account=${account || 'default'}`);
       return response(await routedRpcCall(method, rest, { timeoutMs, account }));
     } catch (error) {
-      return failure(error);
+      return failureFromRpc(error, params?.account || null);
     }
   });
 }
 
-register('whatsapp_status', {
-  description: 'Check whether the private local WhatsApp linked-device backend is paired and ready. This does not read messages.',
-  inputSchema: {},
-  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-}, 'status', 5000);
-
 server.registerTool('whatsapp_list_accounts', {
-  description: 'List all configured WhatsApp accounts with their IDs, aliases, and connection status. Use this to discover available accounts before specifying an account parameter.',
+  description: 'List all configured WhatsApp accounts with IDs, aliases, and connection status. Preferred discovery tool before using account-specific operations.',
   inputSchema: {},
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, async () => {
   try {
     const config = await getAccounts();
-    const statuses = await Promise.all(config.accounts.map(async (a) => {
-      try {
-        const status = await routedRpcCall('status', {}, { timeoutMs: 3000, account: a.id });
-        return { ...a, phase: status.phase, ready: status.ready, policyMode: status.policyMode };
-      } catch {
-        return { ...a, phase: 'unreachable', ready: false, policyMode: null };
-      }
+    const statuses = await Promise.all(config.accounts.map(async (entry) => {
+      const status = await readAccountStatus({ accountId: entry.id, timeoutMs: 3000 });
+      const enriched = enrichStatus({ id: entry.id, record: entry }, status);
+      return {
+        id: entry.id,
+        alias: entry.alias,
+        description: entry.description,
+        ready: enriched.ready,
+        phase: enriched.phase,
+        code: enriched.code,
+        source: status.source,
+        userMessage: enriched.userMessage,
+      };
     }));
     return response({ default: config.default, accounts: statuses });
   } catch (error) {
     return failure(error);
+  }
+});
+
+server.registerTool('whatsapp_status', {
+  description: 'Check whether the private local WhatsApp linked-device backend is paired and ready. Returns structured guidance when the backend is stopped, pairing, or syncing. Does not read messages.',
+  inputSchema: {
+    account: z.string().optional().describe('Account ID or alias. Omit to use the default account.'),
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+}, async ({ account } = {}) => {
+  try {
+    const accountMeta = await resolveAccount(account || null);
+    const status = await readAccountStatus({
+      accountId: accountMeta.id,
+      pathsForAccount: accountMeta.paths,
+      timeoutMs: 5000,
+    });
+    return response(enrichStatus(accountMeta, status));
+  } catch (error) {
+    return failureFromRpc(error, account || null);
+  }
+});
+
+server.registerTool('whatsapp_doctor', {
+  description: 'One-shot diagnosis for agents: configured accounts, backend readiness, pairing/QR hints, and exact next steps/commands. Call this first in a new chat when WhatsApp tools fail or status is unknown.',
+  inputSchema: {
+    account: z.string().optional().describe('Optional account to highlight. Omit to diagnose default + summarize all accounts.'),
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+}, async ({ account } = {}) => {
+  try {
+    const config = await getAccounts();
+    const catalog = config.accounts.length
+      ? config.accounts
+      : [{ id: null, alias: 'default', description: 'Legacy single-account' }];
+    const all = await Promise.all(catalog.map(async (entry) => {
+      const status = await readAccountStatus({ accountId: entry.id, timeoutMs: 3000 });
+      return enrichStatus({ id: entry.id, record: entry }, status);
+    }));
+
+    const focusId = account
+      ? (await resolveAccount(account)).id
+      : (config.default || all[0]?.account || null);
+    const focus = all.find((entry) => entry.account === focusId) || all[0] || null;
+
+    return response({
+      ok: Boolean(focus?.ready),
+      default: config.default,
+      focus,
+      accounts: all.map((entry) => ({
+        account: entry.account,
+        alias: entry.alias,
+        ready: entry.ready,
+        phase: entry.phase,
+        code: entry.code,
+        source: entry.source,
+        userMessage: entry.userMessage,
+      })),
+      agentNextSteps: focus?.agentNextSteps || ['Configure accounts.json and install the LaunchAgent.'],
+      userSteps: focus?.userSteps || [],
+      commands: focus?.commands || null,
+      workflow: {
+        firstCall: 'whatsapp_doctor or whatsapp_list_accounts',
+        reads: 'whatsapp_list_chats / whatsapp_read_messages / whatsapp_search_messages',
+        sends: 'prepare_* → show preview → user OK → whatsapp_request_local_approval',
+        afterTimeout: 'whatsapp_send_outcome',
+      },
+    });
+  } catch (error) {
+    return failureFromRpc(error, account || null);
+  }
+});
+
+server.registerTool('whatsapp_qr', {
+  description: 'Return the private pairing QR PNG path and phone scan instructions when the backend is in pairing mode. Does not print QR pixels. If not pairing, returns structured next steps instead.',
+  inputSchema: {
+    account: z.string().optional().describe('Account ID or alias. Omit to use the default account.'),
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+}, async ({ account } = {}) => {
+  try {
+    const accountMeta = await resolveAccount(account || null);
+    const status = await readAccountStatus({
+      accountId: accountMeta.id,
+      pathsForAccount: accountMeta.paths,
+      timeoutMs: 5000,
+    });
+    const enriched = enrichStatus(accountMeta, status);
+    const qrPath = status.qrPath || accountMeta.paths.qrFile;
+    let qrFilePresent = false;
+    try {
+      await access(qrPath);
+      qrFilePresent = true;
+    } catch {
+      qrFilePresent = false;
+    }
+
+    const pairing = Boolean(status.qrAvailable || status.phase === 'pairing' || (qrFilePresent && !status.ready));
+    if (!pairing) {
+      return response({
+        ...enriched,
+        qrAvailable: false,
+        qrPath: null,
+        qrFilePresent,
+        phoneSteps: [
+          'WhatsApp → Settings → Linked Devices → Link a Device',
+          'Only scan when qrAvailable=true / a QR file is present',
+        ],
+      });
+    }
+
+    return response({
+      ...enriched,
+      code: 'NEEDS_PAIRING',
+      qrAvailable: true,
+      qrPath,
+      qrFilePresent,
+      qrUpdatedAt: status.qrUpdatedAt || null,
+      phoneSteps: [
+        'Open the QR PNG locally with Preview/Finder (private file; mode 0600).',
+        'On the phone: WhatsApp → Settings → Linked Devices → Link a Device',
+        'Scan the QR, then poll whatsapp_wait_ready until ready=true',
+      ],
+      openCommand: `open ${qrPath}`,
+    });
+  } catch (error) {
+    return failureFromRpc(error, account || null);
+  }
+});
+
+server.registerTool('whatsapp_wait_ready', {
+  description: 'Poll backend readiness for a short period. Use after starting the service or while the user scans a pairing QR. Returns structured status/guidance on ready, pairing, or timeout.',
+  inputSchema: {
+    account: z.string().optional().describe('Account ID or alias. Omit to use the default account.'),
+    timeoutSec: z.number().int().min(1).max(180).default(60).describe('Seconds to wait before returning timeout guidance.'),
+    intervalMs: z.number().int().min(250).max(10000).default(2000).describe('Polling interval in milliseconds.'),
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+}, async ({ account, timeoutSec = 60, intervalMs = 2000 } = {}) => {
+  try {
+    const accountMeta = await resolveAccount(account || null);
+    const deadline = Date.now() + (timeoutSec * 1000);
+    let last = null;
+    let attempts = 0;
+
+    while (Date.now() <= deadline) {
+      attempts += 1;
+      last = enrichStatus(
+        accountMeta,
+        await readAccountStatus({
+          accountId: accountMeta.id,
+          pathsForAccount: accountMeta.paths,
+          timeoutMs: Math.min(5000, intervalMs),
+        }),
+      );
+      if (last.ready) {
+        return response({ waited: true, attempts, timedOut: false, ...last });
+      }
+      if (last.phase === 'pairing' || last.code === 'NEEDS_PAIRING') {
+        return response({
+          waited: true,
+          attempts,
+          timedOut: false,
+          ...last,
+          agentNextSteps: [
+            'Backend is waiting for QR scan.',
+            'Call whatsapp_qr and ask the user to scan, then call whatsapp_wait_ready again.',
+            ...last.agentNextSteps,
+          ],
+        });
+      }
+      if (Date.now() + intervalMs > deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+
+    return response({
+      waited: true,
+      attempts,
+      timedOut: true,
+      ...(last || enrichStatus(accountMeta, { ready: false, phase: 'stopped', error: 'No status samples collected' })),
+      userMessage: last?.userMessage || 'Timed out waiting for WhatsApp backend readiness.',
+      agentNextSteps: [
+        `Timed out after ${timeoutSec}s and ${attempts} poll(s).`,
+        'Call whatsapp_doctor and share userMessage with the user.',
+        ...(last?.agentNextSteps || []),
+      ],
+    });
+  } catch (error) {
+    return failureFromRpc(error, account || null);
   }
 });
 
@@ -116,7 +382,7 @@ register('whatsapp_security_audit', {
 }, 'securityAudit', 10000);
 
 register('whatsapp_list_chats', {
-  description: 'List WhatsApp chats available to the paired local account. Returns chat IDs, names, unread counts, and timestamps. Last-message previews are omitted by default to minimize disclosure. Reading does not intentionally mark chats as seen.',
+  description: 'List WhatsApp chats available to the paired local account. Returns chat IDs, names, unread counts, and timestamps. Last-message previews are omitted by default to minimize disclosure. Reading does not intentionally mark chats as seen. If the backend is not ready, returns structured login/start guidance.',
   inputSchema: {
     limit: z.number().int().min(1).max(200).default(50),
     unreadOnly: z.boolean().default(false),
@@ -127,7 +393,7 @@ register('whatsapp_list_chats', {
 }, 'listChats');
 
 register('whatsapp_read_messages', {
-  description: 'Read recent messages from one WhatsApp chat by chat ID or exact unique name. Media is never downloaded. Reading does not intentionally mark the chat as seen.',
+  description: 'Read recent messages from one WhatsApp chat by chat ID or exact unique name. Media is never downloaded. Reading does not intentionally mark the chat as seen. If not authenticated/ready, returns structured guidance instead of content.',
   inputSchema: {
     chat: z.string().min(1).describe('Prefer the stable chat ID returned by whatsapp_list_chats.'),
     limit: z.number().int().min(1).max(200).default(30),
@@ -136,7 +402,7 @@ register('whatsapp_read_messages', {
 }, 'getMessages');
 
 register('whatsapp_search_messages', {
-  description: 'Search cached WhatsApp message text across all chats or within one chat. Media is never downloaded.',
+  description: 'Search cached WhatsApp message text across all chats or within one chat. Media is never downloaded. Requires a ready backend.',
   inputSchema: {
     query: z.string().min(1),
     chat: z.string().min(1).optional().describe('Optional chat ID or exact unique name.'),
@@ -209,7 +475,7 @@ async function main() {
   log.info('start', 'transport=stdio');
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log.info('ready', 'tools=14');
+  log.info('ready', 'tools=18');
 }
 
 main().catch((error) => {

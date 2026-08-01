@@ -61,35 +61,90 @@ runtime tuples are recorded in [`KNOWN-GOOD.md`](./KNOWN-GOOD.md).
 
 1. Install and start the background service:
 
-   `./install-launchagent.sh install`
+   `./install-launchagent.sh install --account alpha`
 
-2. Wait until `./install-launchagent.sh status` reports
+2. Wait until `./install-launchagent.sh status --account alpha` reports
    `qrAvailable=true`.
-3. Obtain the private QR path with `node cli.mjs qr` and open that PNG locally.
+3. Obtain the private QR path with `node cli.mjs qr --account alpha` and open that PNG locally.
 4. On the phone, open **WhatsApp → Settings → Linked Devices → Link a Device**
    and scan the QR.
-5. Verify `node cli.mjs status` reports `ready: true`.
+5. Verify `node cli.mjs status --account alpha` reports `ready: true`.
 
 No visible Chrome window is needed. The QR is generated from the headless
 linked-device session and the same isolated profile continues running after the
 pairing completes.
 
+## MCP setup (VS Code / Copilot / Claude Desktop)
+
+1. Keep the backend LaunchAgent installed for each account you use.
+2. Point the IDE MCP config at `mcp-wrapper.sh` (absolute path):
+
+```json
+{
+  "servers": {
+    "whatseal": {
+      "type": "stdio",
+      "command": "/ABSOLUTE/PATH/TO/whatseal-mcp/mcp-wrapper.sh"
+    }
+  }
+}
+```
+
+Claude Desktop equivalent (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "whatseal": {
+      "command": "/ABSOLUTE/PATH/TO/whatseal-mcp/mcp-wrapper.sh"
+    }
+  }
+}
+```
+
+The MCP process only speaks stdio tools. It does **not** auto-start Chrome.
+If the backend is stopped or unpaired, tools return structured guidance
+(`code`, `userMessage`, `agentNextSteps`, exact shell commands) so other chat
+sessions can tell the user to start/pair instead of failing opaquely.
+
+### Agent workflow expected by server instructions
+
+1. First call: `whatsapp_doctor` or `whatsapp_list_accounts`
+2. If not ready: follow returned `userMessage` / start or pair steps
+3. If pairing: `whatsapp_qr` → user scans Linked Devices → `whatsapp_wait_ready`
+4. Reads: free (`whatsapp_list_chats`, `whatsapp_read_messages`, …)
+5. Sends: `prepare_*` → show exact preview → user OK in chat → `whatsapp_request_local_approval`
+6. Approval timeout: `whatsapp_send_outcome` (never blind re-prepare)
+
 ## Agent tools
 
+### Onboarding / readiness
+- `whatsapp_doctor`
+- `whatsapp_list_accounts`
 - `whatsapp_status`
+- `whatsapp_qr`
+- `whatsapp_wait_ready`
+
+### Diagnostics
 - `whatsapp_compatibility`
 - `whatsapp_compatibility_self_test`
 - `whatsapp_security_audit`
+
+### Read
 - `whatsapp_list_chats`
 - `whatsapp_read_messages`
 - `whatsapp_search_messages`
 - `whatsapp_message_status`
+
+### Write (two-phase + Touch ID)
 - `whatsapp_prepare_send`
 - `whatsapp_prepare_rich_test`
 - `whatsapp_prepare_mark_read`
 - `whatsapp_prepare_reaction`
 - `whatsapp_request_local_approval`
 - `whatsapp_send_outcome`
+
+Every tool accepts optional `account` (id or alias from `accounts.json`).
 
 Chat listing omits last-message previews by default. Reading is intended not to
 mark chats as seen. Sending passes `sendSeen: false`, reconciles missing library
