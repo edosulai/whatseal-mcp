@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useState, useRef, useCallback } from "react";
 import { useSocketContext } from "./socketContext";
 
 const UsersContext = createContext();
@@ -10,34 +10,75 @@ const UsersProvider = ({ children }) => {
 
 	const [users, setUsers] = useState([]);
 	const [loading, setLoading] = useState(true);
+	const [activeChat, setActiveChat] = useState(null);
+	const pollIntervalRef = useRef(null);
 
-	// Fetch chats on mount
+	// Transform API response to UI format
+	const transformChats = useCallback((chats) => {
+		return chats.map((chat) => ({
+			id: chat.id,
+			name: chat.name || chat.id,
+			profile_picture: null,
+			phone_number: chat.id,
+			unread: chat.unread || 0,
+			typing: false,
+			isGroup: chat.isGroup,
+			messages: { TODAY: [] },
+			lastMessage: chat.lastMessage || '',
+			timestamp: chat.timestamp
+		}));
+	}, []);
+
+	// Fetch chats function
+	const loadChats = useCallback(async (preserveMessages = false) => {
+		try {
+			const chats = await api.fetchChats();
+			const formattedUsers = transformChats(chats);
+			
+			setUsers((prevUsers) => {
+				if (!preserveMessages) return formattedUsers;
+				// Preserve loaded messages for existing users
+				return formattedUsers.map(newUser => {
+					const existingUser = prevUsers.find(u => u.id === newUser.id);
+					if (existingUser && existingUser.messages.TODAY.length > 0) {
+						return { ...newUser, messages: existingUser.messages };
+					}
+					return newUser;
+				});
+			});
+		} catch (err) {
+			console.error('Failed to load chats:', err);
+		} finally {
+			setLoading(false);
+		}
+	}, [api, transformChats]);
+
+	// Initial load and polling
 	useEffect(() => {
-		const loadChats = async () => {
-			try {
-				const chats = await api.fetchChats();
-				// Transform to UI format
-				const formattedUsers = chats.map((chat) => ({
-					id: chat.id,
-					name: chat.name || chat.id,
-					profile_picture: null,
-					phone_number: chat.id,
-					unread: chat.unread || 0,
-					typing: false,
-					isGroup: chat.isGroup,
-					messages: { TODAY: [] },
-					lastMessage: chat.lastMessage || '',
-					timestamp: chat.timestamp
-				}));
-				setUsers(formattedUsers);
-			} catch (err) {
-				console.error('Failed to load chats:', err);
-			} finally {
-				setLoading(false);
+		loadChats();
+		
+		// Poll every 5 seconds for new chats/messages
+		pollIntervalRef.current = setInterval(() => {
+			loadChats(true);
+		}, 5000);
+
+		return () => {
+			if (pollIntervalRef.current) {
+				clearInterval(pollIntervalRef.current);
 			}
 		};
-		loadChats();
-	}, [api]);
+	}, [loadChats]);
+
+	// Poll active chat messages more frequently
+	useEffect(() => {
+		if (!activeChat) return;
+		
+		const msgPollInterval = setInterval(() => {
+			loadMessages(activeChat);
+		}, 3000);
+
+		return () => clearInterval(msgPollInterval);
+	}, [activeChat]);
 
 	const _updateUserProp = (userId, prop, value) => {
 		setUsers((users) => {
@@ -89,6 +130,7 @@ const UsersProvider = ({ children }) => {
 
 	const setUserAsUnread = (userId) => {
 		_updateUserProp(userId, "unread", 0);
+		setActiveChat(userId);
 		// Load messages when chat is opened
 		loadMessages(userId);
 	};

@@ -1421,6 +1421,41 @@ async function main() {
     }
   });
 
+  // GET /api/qr - get QR code for pairing
+  app.get('/api/qr', async (req, res) => {
+    try {
+      if (phase === 'ready') {
+        return res.json({ ok: true, result: null, message: 'Already authenticated' });
+      }
+      // Check if QR file exists
+      const qrExists = await readFile(paths.qrFile).then(() => true).catch(() => false);
+      if (!qrExists) {
+        return res.json({ ok: true, result: null, message: 'QR not available yet' });
+      }
+      res.json({
+        ok: true,
+        result: {
+          available: true,
+          imageUrl: '/api/qr/image'
+        }
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // GET /api/qr/image - serve QR code image
+  app.get('/api/qr/image', async (req, res) => {
+    try {
+      const qrData = await readFile(paths.qrFile);
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.send(qrData);
+    } catch (err) {
+      res.status(404).json({ ok: false, error: 'QR code not available' });
+    }
+  });
+
   // GET /api/chats
   app.get('/api/chats', async (req, res) => {
     try {
