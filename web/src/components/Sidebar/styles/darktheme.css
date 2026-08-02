@@ -2,6 +2,14 @@
     border-right-color: #3C4247;
 }
 
+.dark-theme .sidebar__account-name {
+    color: rgba(241, 241, 242, 0.96);
+}
+
+.dark-theme .sidebar__account-id {
+    color: rgba(241, 241, 242, 0.63);
+}
+
 .dark-theme .sidebar__alert--warning {
     background: #d7a53b;
 }

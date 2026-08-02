@@ -10,11 +10,14 @@
   "scripts": {
     "daemon": "node daemon.mjs",
     "mcp": "node mcp-server.mjs",
-    "web": "cd web && NODE_OPTIONS=--openssl-legacy-provider npm start",
+    "web": "node web-gateway.mjs",
+    "web:gateway": "node web-gateway.mjs",
+    "web:ui": "cd web && PORT=3010 BROWSER=none NODE_OPTIONS=--openssl-legacy-provider npm start",
+    "web:dev": "WHATSEAL_WEB_DEV_PROXY=http://127.0.0.1:3010 node web-gateway.mjs",
     "web:build": "cd web && NODE_OPTIONS=--openssl-legacy-provider npm run build",
     "web:install": "cd web && npm install",
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check daemon.mjs && node --check cli.mjs && node --check mcp-server.mjs && node --check approve-baseline.mjs && node --test tests/*.test.mjs"
+    "check": "node --check daemon.mjs && node --check cli.mjs && node --check mcp-server.mjs && node --check web-gateway.mjs && node --check approve-baseline.mjs && node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",

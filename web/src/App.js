@@ -6,54 +6,43 @@ import Home from "./pages/Home";
 import Sidebar from "components/Sidebar";
 import Chat from "pages/Chat";
 import Pairing from "pages/Pairing";
+import { useSocketContext } from "context/socketContext";
 
 const userPrefersDark =
 	window.matchMedia &&
 	window.matchMedia("(prefers-color-scheme: dark)").matches;
 
-// Port = 30000 + last 4 account digits. Non-numeric ids fall back to 30001.
-// Override: ?account=alpha or REACT_APP_API_URL.
-function resolveApiUrl() {
-	if (process.env.REACT_APP_API_URL) return process.env.REACT_APP_API_URL;
-	try {
-		const params = new URLSearchParams(window.location.search);
-		const account = params.get('account') || localStorage.getItem('whatsealAccount') || 'alpha';
-		const digits = String(account).replace(/\D/g, '') || 'alpha';
-		const last4 = digits.slice(-4).padStart(4, '0');
-		const port = 30000 + parseInt(last4, 10);
-		return `http://localhost:${port}`;
-	} catch (_) { /* ignore */ }
-	return 'http://localhost:30001';
-}
-const API_URL = resolveApiUrl();
-
 function App() {
+	const api = useSocketContext();
 	const [appLoaded, setAppLoaded] = useState(false);
 	const [startLoadProgress, setStartLoadProgress] = useState(false);
-	const [waStatus, setWaStatus] = useState({ phase: 'loading', ready: false });
+	const [waStatus, setWaStatus] = useState({ phase: "loading", ready: false });
 
 	useEffect(() => {
 		if (userPrefersDark) document.body.classList.add("dark-theme");
 		stopLoad();
 	}, []);
 
-	// Check WhatsApp status
+	// Check WhatsApp status for the selected account (via gateway header).
 	useEffect(() => {
+		let cancelled = false;
 		const checkStatus = async () => {
 			try {
-				const res = await fetch(`${API_URL}/api/status`);
-				const data = await res.json();
-				if (data.ok) {
+				const data = await api.fetchStatus();
+				if (!cancelled && data.ok) {
 					setWaStatus(data.result);
 				}
 			} catch (err) {
-				setWaStatus({ phase: 'error', ready: false });
+				if (!cancelled) setWaStatus({ phase: "error", ready: false });
 			}
 		};
 		checkStatus();
 		const interval = setInterval(checkStatus, 3000);
-		return () => clearInterval(interval);
-	}, []);
+		return () => {
+			cancelled = true;
+			clearInterval(interval);
+		};
+	}, [api, api.account]);
 
 	const stopLoad = () => {
 		setStartLoadProgress(true);
@@ -63,7 +52,7 @@ function App() {
 	if (!appLoaded) return <Loader done={startLoadProgress} />;
 
 	// Show pairing screen if not ready
-	if (waStatus.phase === 'pairing') {
+	if (waStatus.phase === "pairing") {
 		return (
 			<div className="app">
 				<Pairing />

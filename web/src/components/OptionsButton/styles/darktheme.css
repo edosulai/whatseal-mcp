@@ -13,3 +13,11 @@
 .dark-theme .options-btn__option:hover {
     background: #20272b;
 }
+
+.dark-theme .options-btn__option--disabled {
+    color: rgba(241, 241, 242, 0.45);
+}
+
+.dark-theme .options-btn__option--active {
+    background: #20272b;
+}

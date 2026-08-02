@@ -1,15 +1,15 @@
 import Icon from "components/Icon";
 import React from "react";
 import formatTime from "utils/formatTime";
-
-const API_URL = "http://localhost:5001";
+import { useSocketContext } from "context/socketContext";
 
 const Convo = ({ lastMsgRef, messages: allMessages }) => {
+	const api = useSocketContext();
 	const dates = Object.keys(allMessages);
 
 	const renderMedia = (message, assignRef) => {
 		const isReceived = message.sender;
-		const mediaUrl = message.mediaUrl ? `${API_URL}${message.mediaUrl}` : null;
+		const mediaUrl = message.mediaUrl ? api.mediaUrl(message.mediaUrl) : null;
 		
 		// Sticker
 		if (message.type === 'sticker' && mediaUrl) {

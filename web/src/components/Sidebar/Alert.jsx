@@ -4,33 +4,35 @@ import { useSocketContext } from "context/socketContext";
 
 const Alert = () => {
 	const api = useSocketContext();
-	const [status, setStatus] = useState({ phase: 'loading', ready: false });
+	const [status, setStatus] = useState({ phase: "loading", ready: false });
 
 	useEffect(() => {
+		let cancelled = false;
 		const checkStatus = async () => {
 			try {
-				const res = await fetch(`${api.baseUrl}/api/status`);
-				const data = await res.json();
-				if (data.ok) {
+				const data = await api.fetchStatus();
+				if (!cancelled && data.ok) {
 					setStatus(data.result);
 				}
 			} catch (err) {
-				setStatus({ phase: 'error', ready: false });
+				if (!cancelled) setStatus({ phase: "error", ready: false });
 			}
 		};
 		checkStatus();
-		// Poll every 5 seconds
 		const interval = setInterval(checkStatus, 5000);
-		return () => clearInterval(interval);
-	}, [api.baseUrl]);
+		return () => {
+			cancelled = true;
+			clearInterval(interval);
+		};
+	}, [api, api.account]);
 
 	// Don't show alert if connected
-	if (status.ready && status.connectionState === 'CONNECTED') {
+	if (status.ready && status.connectionState === "CONNECTED") {
 		return null;
 	}
 
 	// Show pairing QR alert
-	if (status.phase === 'pairing') {
+	if (status.phase === "pairing") {
 		return (
 			<div className="sidebar__alert sidebar__alert--info">
 				<div className="sidebar__alert-icon-wrapper">
@@ -39,7 +41,7 @@ const Alert = () => {
 				<div className="sidebar__alert-texts">
 					<p className="sidebar__alert-text">Scan QR Code</p>
 					<p className="sidebar__alert-text">
-						Open WhatsApp on your phone to link this device.
+						Open WhatsApp on your phone to link this device ({api.account}).
 					</p>
 				</div>
 			</div>
@@ -47,7 +49,7 @@ const Alert = () => {
 	}
 
 	// Show disconnected warning
-	if (status.phase === 'error' || !status.ready) {
+	if (status.phase === "error" || !status.ready) {
 		return (
 			<div className="sidebar__alert sidebar__alert--warning">
 				<div className="sidebar__alert-icon-wrapper">
@@ -56,7 +58,8 @@ const Alert = () => {
 				<div className="sidebar__alert-texts">
 					<p className="sidebar__alert-text">Phone Not Connected</p>
 					<p className="sidebar__alert-text">
-						Make sure your phone has an active internet connection.{" "}
+						Account {api.account} is not ready yet. Use the menu to switch
+						accounts, or wait for the backend to finish starting.{" "}
 						<a
 							className="underline"
 							href="https://faq.whatsapp.com/web/troubleshooting/cant-connect-to-whatsapp-web-or-desktop/"

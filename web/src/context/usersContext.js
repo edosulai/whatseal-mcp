@@ -53,10 +53,13 @@ const UsersProvider = ({ children }) => {
 		}
 	}, [api, transformChats]);
 
-	// Initial load and polling
+	// Initial load and polling (rebind when account changes via api identity).
 	useEffect(() => {
-		loadChats();
-		
+		setLoading(true);
+		setUsers([]);
+		setActiveChat(null);
+		loadChats(false);
+
 		// Poll every 5 seconds for new chats/messages
 		pollIntervalRef.current = setInterval(() => {
 			loadChats(true);
@@ -67,7 +70,7 @@ const UsersProvider = ({ children }) => {
 				clearInterval(pollIntervalRef.current);
 			}
 		};
-	}, [loadChats]);
+	}, [loadChats, api.account]);
 
 	const _updateUserProp = (userId, prop, value) => {
 		setUsers((users) => {

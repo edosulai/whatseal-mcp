@@ -23,6 +23,25 @@
 	font-weight: 500;
 }
 
+.pairing__account-switch {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	text-align: left;
+	margin-bottom: 20px;
+	color: #667781;
+	font-size: 13px;
+}
+
+.pairing__account-switch select {
+	padding: 10px 12px;
+	border: 1px solid #d1d7db;
+	border-radius: 8px;
+	background: #fff;
+	color: #111b21;
+	font-size: 14px;
+}
+
 .pairing__steps {
 	text-align: left;
 	margin-bottom: 24px;
@@ -90,6 +109,16 @@ body.dark-theme .pairing__container {
 
 body.dark-theme .pairing__title {
 	color: #00a884;
+}
+
+body.dark-theme .pairing__account-switch {
+	color: #8696a0;
+}
+
+body.dark-theme .pairing__account-switch select {
+	background: #111b21;
+	border-color: #2a3942;
+	color: #e9edef;
 }
 
 body.dark-theme .pairing__steps {
