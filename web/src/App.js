@@ -11,7 +11,21 @@ const userPrefersDark =
 	window.matchMedia &&
 	window.matchMedia("(prefers-color-scheme: dark)").matches;
 
-const API_URL = "http://localhost:5001";
+// Port = last 4 account digits (default alpha). Override: ?account=alpha or REACT_APP_API_URL.
+function resolveApiUrl() {
+	if (process.env.REACT_APP_API_URL) return process.env.REACT_APP_API_URL;
+	try {
+		const params = new URLSearchParams(window.location.search);
+		const account = params.get('account') || localStorage.getItem('whatsealAccount') || 'alpha';
+		if (/^\d+$/.test(account)) {
+			const n = parseInt(account, 10);
+			const port = n >= 1024 && n <= 65535 ? n : n >= 1 && n <= 1023 ? 10000 + n : 30001;
+			return `http://localhost:${port}`;
+		}
+	} catch (_) { /* ignore */ }
+	return 'http://localhost:30001';
+}
+const API_URL = resolveApiUrl();
 
 function App() {
 	const [appLoaded, setAppLoaded] = useState(false);

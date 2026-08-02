@@ -64,15 +64,25 @@ if [[ -n "$ACCOUNT_ID" ]]; then
   MARKER="${STATE_DIR}/launchagent-owned"
   APPROVAL_HELPER="${STATE_DIR}/native-approval"
   BASELINE_APPROVAL_HELPER="${STATE_DIR}/native-baseline-approval"
-  if [[ -z "$HTTP_PORT" ]]; then
-    case "$ACCOUNT_ID" in
-      beta) HTTP_PORT=5001 ;;
-      alpha) HTTP_PORT=5002 ;;
-      *) HTTP_PORT=$((5010 + $(printf '%s' "$ACCOUNT_ID" | cksum | awk '{print $1 % 90}'))) ;;
-    esac
+fi
+
+# Port rule: use numeric account id (alpha → alpha). Ports <1024 are privileged, so
+# alpha → 30001. Explicit WHATSAPP_HTTP_PORT always wins.
+if [[ -z "$HTTP_PORT" ]]; then
+  id_for_port="${ACCOUNT_ID:-alpha}"
+  if [[ "$id_for_port" =~ ^[0-9]+$ ]]; then
+    # 10# forces base-10 so leading zeros (0001) are not octal
+    n=$((10#$id_for_port))
+    if (( n >= 1024 && n <= 65535 )); then
+      HTTP_PORT="$n"
+    elif (( n >= 1 && n <= 1023 )); then
+      HTTP_PORT=$((10000 + n))
+    else
+      HTTP_PORT=30001
+    fi
+  else
+    HTTP_PORT=$((20000 + $(printf '%s' "$id_for_port" | cksum | awk '{print $1 % 10000}')))
   fi
-else
-  HTTP_PORT="${HTTP_PORT:-5001}"
 fi
 
 NODE_BIN="$(command -v node || true)"

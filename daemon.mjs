@@ -36,15 +36,23 @@ const paths = accountPaths(accountId);
 
 function resolveHttpPort(id = null) {
   const fromEnv = Number(process.env.WHATSAPP_HTTP_PORT || 0);
-  if (Number.isInteger(fromEnv) && fromEnv > 0) return fromEnv;
-  if (!id) return 5001;
-  const known = { 'beta': 5001, 'alpha': 5002 };
-  if (known[id]) return known[id];
-  let hash = 0;
-  for (let i = 0; i < id.length; i += 1) {
-    hash = ((hash * 33) + id.charCodeAt(i)) % 90;
+  if (Number.isInteger(fromEnv) && fromEnv >= 1 && fromEnv <= 65535) return fromEnv;
+
+  // Rule: HTTP port = numeric account id (e.g. alpha → 30001).
+  // Ports < 1024 need root on macOS/Linux, so bump into the unprivileged range:
+  // alpha → 30001. Override anytime with WHATSAPP_HTTP_PORT.
+  const raw = id == null || id === '' ? 'alpha' : String(id);
+  if (/^\d+$/.test(raw)) {
+    const n = Number.parseInt(raw, 10);
+    if (n >= 1024 && n <= 65535) return n;
+    if (n >= 1 && n <= 1023) return 10000 + n;
   }
-  return 5010 + hash;
+
+  let hash = 0;
+  for (let i = 0; i < raw.length; i += 1) {
+    hash = ((hash * 33) + raw.charCodeAt(i)) % 10000;
+  }
+  return 20000 + hash;
 }
 
 process.umask(0o077);
@@ -1663,8 +1671,7 @@ async function main() {
     }
   });
 
-  // Multi-account: each daemon needs its own localhost HTTP port.
-  // beta stays on 5001 (web UI default). alpha uses 5002. Others get a stable offset.
+  // Multi-account: each daemon binds its own localhost HTTP port from the account id.
   const HTTP_PORT = resolveHttpPort(accountId);
   httpServer = http.createServer(app);
   await new Promise((resolve, reject) => {
