@@ -38,21 +38,14 @@ function resolveHttpPort(id = null) {
   const fromEnv = Number(process.env.WHATSAPP_HTTP_PORT || 0);
   if (Number.isInteger(fromEnv) && fromEnv >= 1 && fromEnv <= 65535) return fromEnv;
 
-  // Rule: HTTP port = numeric account id (e.g. alpha → 30001).
-  // Ports < 1024 need root on macOS/Linux, so bump into the unprivileged range:
-  // alpha → 30001. Override anytime with WHATSAPP_HTTP_PORT.
-  const raw = id == null || id === '' ? 'alpha' : String(id);
-  if (/^\d+$/.test(raw)) {
-    const n = Number.parseInt(raw, 10);
-    if (n >= 1024 && n <= 65535) return n;
-    if (n >= 1 && n <= 1023) return 10000 + n;
-  }
-
-  let hash = 0;
-  for (let i = 0; i < raw.length; i += 1) {
-    hash = ((hash * 33) + raw.charCodeAt(i)) % 10000;
-  }
-  return 20000 + hash;
+  // Port = 30000 + last 4 digits of account id (preserves leading zeros in the label).
+  // Numeric ids map to 30000-39999. Non-numeric ids fall back to 30001.
+  //   account beta → 30001
+  //   account alpha → 30001
+  // Range 30000–39999 is always unprivileged. Override with WHATSAPP_HTTP_PORT.
+  const digits = String(id ?? 'alpha').replace(/\D/g, '') || 'alpha';
+  const last4 = digits.slice(-4).padStart(4, '0');
+  return 30000 + Number.parseInt(last4, 10);
 }
 
 process.umask(0o077);

@@ -1,17 +1,16 @@
 import { createContext, useContext } from "react";
 
-// Port rule matches daemon: numeric account id. Default account alpha → :30001.
-// Non-numeric ids fall back to 30001. Override with ?account=alpha or REACT_APP_API_URL.
+// Port rule matches daemon: 30000 + last 4 account digits.
+// alpha → 30001, beta → 30002. Override with ?account=alpha or REACT_APP_API_URL.
 function resolveApiUrl() {
 	if (process.env.REACT_APP_API_URL) return process.env.REACT_APP_API_URL;
 	try {
 		const params = new URLSearchParams(window.location.search);
 		const account = params.get('account') || localStorage.getItem('whatsealAccount') || 'alpha';
-		if (/^\d+$/.test(account)) {
-			const n = parseInt(account, 10);
-			const port = n >= 1024 && n <= 65535 ? n : n >= 1 && n <= 1023 ? 10000 + n : 30001;
-			return `http://localhost:${port}`;
-		}
+		const digits = String(account).replace(/\D/g, '') || 'alpha';
+		const last4 = digits.slice(-4).padStart(4, '0');
+		const port = 30000 + parseInt(last4, 10);
+		return `http://localhost:${port}`;
 	} catch (_) { /* ignore */ }
 	return 'http://localhost:30001';
 }

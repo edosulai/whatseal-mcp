@@ -66,23 +66,17 @@ if [[ -n "$ACCOUNT_ID" ]]; then
   BASELINE_APPROVAL_HELPER="${STATE_DIR}/native-baseline-approval"
 fi
 
-# Port rule: use numeric account id (alpha → alpha). Ports <1024 are privileged, so
-# alpha → 30001. Explicit WHATSAPP_HTTP_PORT always wins.
+# Port = 30000 + last 4 digits of account id (uses the last 4 digits of the account id):
+#   beta → 30001
+#   alpha → 30001
+# Explicit WHATSAPP_HTTP_PORT always wins.
 if [[ -z "$HTTP_PORT" ]]; then
   id_for_port="${ACCOUNT_ID:-alpha}"
-  if [[ "$id_for_port" =~ ^[0-9]+$ ]]; then
-    # 10# forces base-10 so leading zeros (0001) are not octal
-    n=$((10#$id_for_port))
-    if (( n >= 1024 && n <= 65535 )); then
-      HTTP_PORT="$n"
-    elif (( n >= 1 && n <= 1023 )); then
-      HTTP_PORT=$((10000 + n))
-    else
-      HTTP_PORT=30001
-    fi
-  else
-    HTTP_PORT=$((20000 + $(printf '%s' "$id_for_port" | cksum | awk '{print $1 % 10000}')))
-  fi
+  digits="$(printf '%s' "$id_for_port" | tr -cd '0-9')"
+  [[ -n "$digits" ]] || digits="0001"
+  # last 4 chars, left-pad with zeros (preserves 0001 → 0001, not 1)
+  last4="$(printf '%s' "$digits" | awk '{ s=$0; while (length(s)<4) s="0" s; print substr(s, length(s)-3) }')"
+  HTTP_PORT=$((30000 + 10#$last4))
 fi
 
 NODE_BIN="$(command -v node || true)"
