@@ -419,6 +419,32 @@ register('whatsapp_message_status', {
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, 'messageStatus');
 
+register('whatsapp_get_last_call', {
+  description: 'Get info about the last incoming WhatsApp call and any in-progress voice-bot call. Experimental: web client can auto-accept and inject bot audio via Chrome fake microphone.',
+  inputSchema: {},
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+}, 'getLastCall');
+
+register('whatsapp_reject_call', {
+  description: 'Reject the current incoming WhatsApp call if it is still ringing.',
+  inputSchema: {},
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+}, 'rejectCall');
+
+register('whatsapp_accept_call', {
+  description: 'Manually accept the latest incoming WhatsApp call (experimental voice-bot). By default plays bot WAV via Chrome fake mic then hangs up. Prefer auto-accept for live tests.',
+  inputSchema: {
+    hangupAfterAudio: z.boolean().optional().describe('Hang up after bot audio finishes. Default true.'),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+}, 'acceptCall', 60000);
+
+register('whatsapp_hangup_call', {
+  description: 'Hang up the currently active WhatsApp call (experimental).',
+  inputSchema: {},
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+}, 'hangupCall');
+
 register('whatsapp_prepare_send', {
   description: 'Prepare and preview a WhatsApp message without sending it. Always use this first, show the exact target and text to the user, and wait for explicit approval before requesting the native Touch ID dialog.',
   inputSchema: {
@@ -475,7 +501,7 @@ async function main() {
   log.info('start', 'transport=stdio');
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log.info('ready', 'tools=18');
+  log.info('ready', 'tools=20');
 }
 
 main().catch((error) => {

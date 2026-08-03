@@ -80,6 +80,34 @@ const activeSockets = new Set();
 const sendOutcomes = new Map();
 const acknowledgementHistory = new Map();
 
+// Experimental voice-bot settings. Audio is injected as Chrome's fake microphone
+// (--use-file-for-fake-audio-capture). Change file via WHATSAPP_BOT_AUDIO.
+// Disable auto-accept with WHATSAPP_AUTO_ACCEPT_CALLS=0.
+const defaultBotAudio = path.join(sourceRoot, 'assets/audio/bot-greeting-id.wav');
+const botAudioPath = process.env.WHATSAPP_BOT_AUDIO
+  ? path.resolve(process.env.WHATSAPP_BOT_AUDIO)
+  : defaultBotAudio;
+const autoAcceptCalls = process.env.WHATSAPP_AUTO_ACCEPT_CALLS !== '0';
+// Headed Chrome is more reliable for WhatsApp call UI + WebRTC accept.
+// Set WHATSAPP_HEADLESS=1 to force pure headless again.
+const voiceBotHeadless = process.env.WHATSAPP_HEADLESS === '1'
+  ? true
+  : (autoAcceptCalls ? false : true);
+const botHangupPaddingMs = Number(process.env.WHATSAPP_BOT_HANGUP_PADDING_MS || 1500);
+let lastCall = null;
+let activeBotCall = null;
+let botCallInFlight = false;
+let cachedChatLockSecret = undefined;
+
+function logJson(level, event, detail) {
+  const payload = detail === undefined
+    ? ''
+    : (typeof detail === 'string' ? detail : JSON.stringify(detail));
+  if (level === 'error') log.error(event, payload);
+  else if (level === 'debug') log.debug(event, payload);
+  else log.info(event, payload);
+}
+
 if (help) {
   process.stdout.write('Usage: node daemon.mjs [--verbose|-v]\n\nRuns the private local WhatsApp Web backend.\n');
   process.exit(0);
@@ -141,7 +169,9 @@ const client = new Client({
   authTimeoutMs: 120000,
   qrMaxRetries: 0,
   puppeteer: {
-    headless: true,
+    // Headed mode when auto-accept is enabled: WhatsApp's call accept UI/WebRTC
+    // is more reliable with a real window than pure headless.
+    headless: voiceBotHeadless,
     executablePath: chromePath,
     pipe: true,
     args: [
@@ -150,7 +180,15 @@ const client = new Client({
       '--disable-features=Translate,MediaRouter',
       '--no-first-run',
       '--no-default-browser-check',
+      // Experimental voice-bot: inject WAV as the page microphone so WA can send it.
+      // File can be swapped later via WHATSAPP_BOT_AUDIO without code changes.
+      '--use-fake-device-for-media-stream',
+      '--use-fake-ui-for-media-stream',
+      `--use-file-for-fake-audio-capture=${botAudioPath}`,
+      '--autoplay-policy=no-user-gesture-required',
+      '--window-size=1280,900',
     ],
+    defaultViewport: { width: 1280, height: 900 },
   },
 });
 
@@ -1003,6 +1041,137 @@ async function dispatch(method, params = {}) {
     return await getSecurityAudit();
   }
 
+  // Call-related methods (experimental voice-bot)
+  if (method === 'getLastCall') {
+    const safeLastCall = lastCall
+      ? {
+          id: lastCall.id,
+          from: lastCall.from,
+          isVideo: lastCall.isVideo,
+          isGroup: lastCall.isGroup,
+          canHandleLocally: lastCall.canHandleLocally,
+          webClientShouldHandle: lastCall.webClientShouldHandle,
+          timestamp: lastCall.timestamp,
+        }
+      : null;
+    return {
+      lastCall: safeLastCall,
+      activeBotCall: activeBotCall || null,
+      autoAcceptCalls,
+      botAudioPath,
+      message: safeLastCall ? undefined : 'No incoming calls detected since daemon started.',
+    };
+  }
+
+  if (method === 'getCallBotConfig') {
+    return {
+      autoAcceptCalls,
+      botAudioPath,
+      botHangupPaddingMs,
+      headless: voiceBotHeadless,
+      canChangeAudio: 'Set WHATSAPP_BOT_AUDIO to another WAV path and restart the daemon.',
+      disableAutoAccept: 'Set WHATSAPP_AUTO_ACCEPT_CALLS=0 and restart the daemon.',
+      forceHeadless: 'Set WHATSAPP_HEADLESS=1 to force headless (less reliable for accept UI).',
+      note: 'Desktop notification banner is ENABLED via "Turn on" (never closed). Browser notification permission is also granted. Auto-accept still needs WhatsApp Web to render Accept call controls.',
+    };
+  }
+
+  if (method === 'rejectCall') {
+    if (!lastCall) return { success: false, error: 'No active call to reject.' };
+    try {
+      const rejected = await rejectActiveCall(lastCall);
+      return rejected;
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+
+  if (method === 'exploreCallApi') {
+    try {
+      return await inspectCallApi();
+    } catch (err) {
+      return { error: err.message };
+    }
+  }
+
+  if (method === 'acceptCall') {
+    if (!lastCall) return { success: false, error: 'No active call to accept.' };
+    try {
+      const result = await acceptIncomingCall(lastCall, { hangupAfterAudio: params.hangupAfterAudio !== false });
+      return result;
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+
+  if (method === 'hangupCall') {
+    try {
+      const result = await hangupActiveCall();
+      return result;
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+
+  if (method === 'getChatLockSecretStatus') {
+    const secret = await loadChatLockSecretCode();
+    return {
+      accountId,
+      configured: Boolean(secret),
+      secretsPath: paths.secretsFile,
+      // Never return the actual secret via RPC.
+      source: secret ? 'secrets.json' : null,
+    };
+  }
+
+  if (method === 'setChatLockSecret') {
+    const code = String(params.code || params.secretCode || params.chatLockSecretCode || '').trim();
+    if (!code) return { success: false, error: 'code is required' };
+    if (code.length < 4 || code.length > 64) {
+      return { success: false, error: 'code length must be between 4 and 64 characters' };
+    }
+    await ensurePrivateDirectories(paths);
+    const existing = await readJson(paths.secretsFile, {});
+    const next = {
+      ...existing,
+      accountId: accountId || existing.accountId || null,
+      chatLockSecretCode: code,
+      updatedAt: new Date().toISOString(),
+      note: existing.note || 'WhatsApp Chat Lock / Secret Code for locked chats on this linked account.',
+    };
+    await writeJsonAtomic(paths.secretsFile, next, 0o600);
+    cachedChatLockSecret = code;
+    return {
+      success: true,
+      accountId,
+      configured: true,
+      secretsPath: paths.secretsFile,
+      // Never echo the secret back.
+    };
+  }
+
+  if (method === 'unlockChatLock') {
+    try {
+      const result = await unlockChatLockPrompt({
+        code: params.code || params.secretCode || null,
+        // Only type when a real secret-code field is visible.
+        force: Boolean(params.force),
+      });
+      return result;
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+
+  if (method === 'clearSearch') {
+    try {
+      const result = await clearWhatsAppSearchBox();
+      return { success: true, ...result };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+
   await ensureReady();
 
   if (method === 'listChats') {
@@ -1273,6 +1442,10 @@ client.on('authenticated', async () => {
 
 client.on('ready', async () => {
   try {
+    // Enable desktop notifications early so incoming-call UI is more likely to render.
+    const permission = await ensureDesktopNotificationPermission();
+    const notif = await enableDesktopNotifications();
+    logJson('info', 'ready-enable-notifications', { permission, notif });
     await finalizeReady('library-event');
   } catch (error) {
     log.error('ready-finalization-failed', truncateText(error?.message || String(error), 300));
@@ -1310,6 +1483,1013 @@ client.on('disconnected', async (reason) => {
   await publishState();
   log.error('disconnected', String(reason));
   await shutdown('disconnected', 1);
+});
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function getWavDurationMs(filePath) {
+  try {
+    const { stdout } = await execFileAsync('afinfo', [filePath], { timeout: 5000 });
+    const match = String(stdout).match(/estimated duration:\s*([0-9.]+)\s*sec/i);
+    if (!match) return 10000;
+    return Math.max(1000, Math.round(Number(match[1]) * 1000));
+  } catch {
+    return 10000;
+  }
+}
+
+async function inspectCallApi() {
+  return await client.pupPage.evaluate(() => {
+    const info = {};
+    try {
+      const CC = window.require('WAWebCallCollection');
+      info.WAWebCallCollection = {
+        keys: CC ? Object.keys(CC).slice(0, 30) : null,
+        pendingOffers: CC?.pendingOffers,
+        isInConnectedCall: CC?.isInConnectedCall,
+        lastActiveCall: CC?.lastActiveCall ? {
+          id: CC.lastActiveCall.id,
+          peerJid: CC.lastActiveCall.peerJid,
+          state: CC.lastActiveCall.state,
+          isVideo: CC.lastActiveCall.isVideo,
+          canHandleLocally: CC.lastActiveCall.canHandleLocally,
+          webClientShouldHandle: CC.lastActiveCall.webClientShouldHandle,
+          proto: Object.getOwnPropertyNames(Object.getPrototypeOf(CC.lastActiveCall)).slice(0, 40),
+        } : null,
+      };
+    } catch (e) {
+      info.WAWebCallCollection = e.message;
+    }
+
+    try {
+      const Call = window.Store?.Call;
+      if (Call) {
+        info.StoreCallModels = (Call.getModelsArray?.() || []).map((c) => ({
+          id: c.id,
+          peerJid: c.peerJid,
+          state: c.state,
+          canHandleLocally: c.canHandleLocally,
+          webClientShouldHandle: c.webClientShouldHandle,
+          allMethods: Object.getOwnPropertyNames(Object.getPrototypeOf(c)),
+        }));
+      }
+    } catch (e) {
+      info.StoreCall = e.message;
+    }
+
+    // Scan visible call controls so accept/hangup selectors can be adapted.
+    info.uiButtons = Array.from(document.querySelectorAll('button, [role="button"]'))
+      .map((el) => ({
+        tag: el.tagName,
+        ariaLabel: el.getAttribute('aria-label') || '',
+        title: el.getAttribute('title') || '',
+        text: (el.innerText || el.textContent || '').trim().slice(0, 80),
+        dataTestId: el.getAttribute('data-testid') || '',
+      }))
+      .filter((btn) => /accept|answer|decline|reject|end|hang|call|terima|tolak|akhiri/i.test(`${btn.ariaLabel} ${btn.title} ${btn.text} ${btn.dataTestId}`))
+      .slice(0, 30);
+
+    return info;
+  });
+}
+
+async function focusWhatsAppWindow({ clickBody = false } = {}) {
+  // Bring the Chrome tab forward only.
+  // NEVER click document.body by default — that dismisses WhatsApp's incoming-call toast/popup.
+  try {
+    if (client.pupPage?.bringToFront) await client.pupPage.bringToFront();
+  } catch {
+    // ignore
+  }
+  try {
+    await client.pupPage.evaluate((shouldClickBody) => {
+      window.focus?.();
+      if (shouldClickBody) document.body?.click?.();
+    }, clickBody);
+  } catch {
+    // ignore
+  }
+}
+
+async function ensureDesktopNotificationPermission() {
+  // Grant browser-level Notification permission for web.whatsapp.com so the
+  // in-page "Turn on" flow can complete (and call toasts can render).
+  const result = { override: null, permission: null };
+  try {
+    const page = client.pupPage;
+    if (!page) return { ...result, error: 'no page' };
+    const origin = 'https://web.whatsapp.com';
+    const context = page.browserContext?.() || page.browser()?.defaultBrowserContext?.();
+    if (context?.overridePermissions) {
+      await context.overridePermissions(origin, ['notifications', 'microphone', 'camera']);
+      result.override = 'granted-notifications-microphone-camera';
+    }
+    result.permission = await page.evaluate(async () => {
+      try {
+        if (!('Notification' in window)) return 'unsupported';
+        if (Notification.permission === 'granted') return 'already-granted';
+        if (Notification.permission === 'denied') return 'denied';
+        const next = await Notification.requestPermission();
+        return next;
+      } catch (error) {
+        return `error:${error.message}`;
+      }
+    });
+  } catch (error) {
+    result.error = error.message;
+  }
+  return result;
+}
+
+async function loadChatLockSecretCode() {
+  if (cachedChatLockSecret !== undefined) return cachedChatLockSecret;
+  try {
+    const secrets = await readJson(paths.secretsFile, null);
+    const code = String(
+      secrets?.chatLockSecretCode
+      || secrets?.secretCode
+      || secrets?.chatLockCode
+      || '',
+    ).trim();
+    cachedChatLockSecret = code || null;
+  } catch {
+    cachedChatLockSecret = null;
+  }
+  return cachedChatLockSecret;
+}
+
+async function clearWhatsAppSearchBox() {
+  if (!client.pupPage) return { cleared: false, reason: 'no page' };
+  return await client.pupPage.evaluate(() => {
+    const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect?.() || { width: 0, height: 0 };
+      return rect.width > 0 && rect.height > 0;
+    };
+    const labelOf = (el) => normalize([
+      el.getAttribute('aria-label') || '',
+      el.getAttribute('placeholder') || '',
+      el.getAttribute('data-testid') || '',
+      el.getAttribute('title') || '',
+    ].join(' '));
+
+    const searchInputs = Array.from(document.querySelectorAll('input, [contenteditable="true"], [role="textbox"]'))
+      .filter(isVisible)
+      .filter((el) => /search|cari/.test(labelOf(el)));
+
+    let cleared = 0;
+    for (const el of searchInputs) {
+      try {
+        el.focus();
+        if ('value' in el) {
+          const proto = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+          if (proto?.set) proto.set.call(el, '');
+          else el.value = '';
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        } else {
+          el.textContent = '';
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, data: '', inputType: 'deleteContentBackward' }));
+        }
+        cleared += 1;
+      } catch {
+        // ignore
+      }
+    }
+
+    // Click the X clear button if present.
+    for (const el of document.querySelectorAll('button, [role="button"], span[data-icon="x"], span[data-icon="x-refreshed"]')) {
+      if (!isVisible(el)) continue;
+      const label = labelOf(el);
+      const icon = el.getAttribute('data-icon') || el.querySelector?.('[data-icon]')?.getAttribute('data-icon') || '';
+      if (/clear|close search|x-refreshed|^x$/.test(`${label} ${icon}`)) {
+        try { el.click(); } catch { /* ignore */ }
+      }
+    }
+    return { cleared, count: searchInputs.length };
+  });
+}
+
+async function unlockChatLockPrompt({ code = null, force = false } = {}) {
+  const secret = String(code || await loadChatLockSecretCode() || '').trim();
+  if (!secret) {
+    return {
+      success: false,
+      configured: false,
+      error: 'No chat-lock secret configured. Save chatLockSecretCode in secrets.json first.',
+    };
+  }
+
+  if (!client.pupPage) {
+    return { success: false, configured: true, error: 'WhatsApp page not ready.' };
+  }
+
+  // Detect ONLY a real chat-lock / secret-code prompt. Never fall back to the search box.
+  const detected = await client.pupPage.evaluate(() => {
+    const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const body = normalize(document.body?.innerText || '').toLowerCase();
+    const looksLocked = (
+      /enter your secret code/.test(body)
+      || /secret code/.test(body)
+      || /chat lock/.test(body)
+      || /kode rahasia/.test(body)
+      || /masukkan kode/.test(body)
+    );
+
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect?.() || { width: 0, height: 0 };
+      return rect.width > 0 && rect.height > 0;
+    };
+    const labelOf = (el) => normalize([
+      el.getAttribute('aria-label') || '',
+      el.getAttribute('placeholder') || '',
+      el.getAttribute('name') || '',
+      el.getAttribute('autocomplete') || '',
+      el.getAttribute('data-testid') || '',
+      el.getAttribute('title') || '',
+    ].join(' '));
+
+    const inputs = Array.from(document.querySelectorAll('input, [contenteditable="true"], [role="textbox"]'))
+      .filter(isVisible)
+      .map((el) => {
+        const label = labelOf(el);
+        const type = (el.getAttribute('type') || '').toLowerCase();
+        const isSearch = /search|cari|start a new chat/.test(label.toLowerCase());
+        const passwordLike = (
+          type === 'password'
+          || /password|secret|code|pin|passcode|kode|rahasia|chat.?lock/i.test(label)
+        );
+        return {
+          tag: el.tagName,
+          type,
+          label: label.slice(0, 120),
+          isSearch,
+          passwordLike,
+        };
+      })
+      .slice(0, 30);
+
+    return {
+      looksLocked,
+      bodySnippet: normalize(document.body?.innerText || '').slice(0, 400),
+      inputs,
+      secretInputs: inputs.filter((i) => i.passwordLike && !i.isSearch),
+    };
+  });
+
+  const hasSecretInput = (detected.secretInputs || []).length > 0;
+  if (!detected.looksLocked && !hasSecretInput) {
+    // Safety: if previous runs polluted the search box, clear it.
+    await clearWhatsAppSearchBox();
+    return {
+      success: false,
+      configured: true,
+      skipped: true,
+      reason: 'No chat-lock / secret-code prompt detected.',
+      detected,
+    };
+  }
+
+  // force=true still requires a secret-looking field; never type into search.
+  if (!hasSecretInput) {
+    return {
+      success: false,
+      configured: true,
+      skipped: true,
+      reason: 'Chat-lock text seen but no secret-code input field found.',
+      detected,
+    };
+  }
+
+  // Fill EXACTLY once via the page (no extra Puppeteer keyboard.type).
+  const typed = await client.pupPage.evaluate((secretCode) => {
+    const result = {
+      filled: false,
+      submitted: false,
+      matched: null,
+      clicks: [],
+      errors: [],
+    };
+
+    const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect?.() || { width: 0, height: 0 };
+      return rect.width > 0 && rect.height > 0;
+    };
+    const labelOf = (el) => normalize([
+      el.getAttribute('aria-label') || '',
+      el.getAttribute('placeholder') || '',
+      el.getAttribute('name') || '',
+      el.getAttribute('autocomplete') || '',
+      el.getAttribute('data-testid') || '',
+      el.getAttribute('title') || '',
+    ].join(' '));
+
+    const candidates = Array.from(document.querySelectorAll(
+      'input, [contenteditable="true"], [role="textbox"]',
+    )).filter(isVisible);
+
+    const target = candidates.find((el) => {
+      const label = labelOf(el).toLowerCase();
+      const type = (el.getAttribute('type') || '').toLowerCase();
+      if (/search|cari|start a new chat/.test(label)) return false;
+      return type === 'password'
+        || /secret|code|pin|passcode|kode|rahasia|chat.?lock/.test(label);
+    }) || null;
+
+    if (!target) {
+      result.errors.push('No secret-code input field found (refusing search box fallback)');
+      return result;
+    }
+
+    result.matched = {
+      tag: target.tagName,
+      type: target.getAttribute('type') || '',
+      label: labelOf(target).slice(0, 120),
+    };
+
+    try {
+      target.focus();
+      target.click();
+      // Clear first so we never append/double-fill.
+      if ('value' in target) {
+        const proto = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')
+          || Object.getOwnPropertyDescriptor(Object.getPrototypeOf(target), 'value');
+        if (proto?.set) {
+          proto.set.call(target, '');
+          target.dispatchEvent(new Event('input', { bubbles: true }));
+          proto.set.call(target, secretCode);
+        } else {
+          target.value = secretCode;
+        }
+        target.dispatchEvent(new Event('input', { bubbles: true }));
+        target.dispatchEvent(new Event('change', { bubbles: true }));
+      } else {
+        target.textContent = '';
+        target.textContent = secretCode;
+        target.dispatchEvent(new InputEvent('input', { bubbles: true, data: secretCode, inputType: 'insertText' }));
+      }
+      result.filled = true;
+    } catch (error) {
+      result.errors.push(`fill-failed: ${error.message}`);
+      return result;
+    }
+
+    // Submit once: prefer Unlock/Continue buttons, else single Enter.
+    const submitMatchers = [
+      /^unlock$/i,
+      /^continue$/i,
+      /^ok$/i,
+      /^next$/i,
+      /^enter$/i,
+      /^buka$/i,
+      /^lanjut$/i,
+      /unlock chat/i,
+      /open chat/i,
+    ];
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"], div[role="button"]'))
+      .filter(isVisible);
+    for (const btn of buttons) {
+      const label = labelOf(btn);
+      if (!submitMatchers.some((re) => re.test(label))) continue;
+      try {
+        btn.click();
+        result.clicks.push(label.slice(0, 80));
+        result.submitted = true;
+        break;
+      } catch (error) {
+        result.errors.push(`submit-click-failed: ${error.message}`);
+      }
+    }
+
+    if (!result.submitted) {
+      try {
+        target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+        target.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+        if (typeof target.form?.requestSubmit === 'function') target.form.requestSubmit();
+        result.submitted = true;
+      } catch (error) {
+        result.errors.push(`enter-failed: ${error.message}`);
+      }
+    }
+
+    return result;
+  }, secret);
+
+  await sleep(800);
+  const after = await client.pupPage.evaluate(() => {
+    const body = (document.body?.innerText || '').toLowerCase();
+    return {
+      stillLocked: (
+        /enter your secret code/.test(body)
+        || /secret code/.test(body)
+        || /chat lock/.test(body)
+        || /kode rahasia/.test(body)
+      ),
+      bodySnippet: (document.body?.innerText || '').slice(0, 300),
+    };
+  });
+
+  const success = Boolean(typed?.filled) && !after.stillLocked;
+  logJson('info', 'chat-lock-unlock-attempt', {
+    configured: true,
+    filled: typed?.filled || false,
+    submitted: typed?.submitted || false,
+    stillLocked: after.stillLocked,
+    matched: typed?.matched || null,
+    clicks: typed?.clicks || [],
+    force: Boolean(force),
+  });
+
+  return {
+    success,
+    configured: true,
+    filled: Boolean(typed?.filled),
+    submitted: Boolean(typed?.submitted),
+    stillLocked: Boolean(after.stillLocked),
+    detected,
+    typed: {
+      filled: typed?.filled || false,
+      submitted: typed?.submitted || false,
+      matched: typed?.matched || null,
+      clicks: typed?.clicks || [],
+      errors: typed?.errors || [],
+    },
+    after,
+  };
+}
+
+async function enableDesktopNotifications() {
+  // CORRECT behavior: click "Turn on" so WhatsApp enables desktop notifications.
+  // Do NOT click Close / Not now — that keeps notifications off and can hide call UI.
+  return await client.pupPage.evaluate(() => {
+    const result = {
+      clicked: [],
+      candidates: [],
+      permission: (typeof Notification !== 'undefined' ? Notification.permission : 'unsupported'),
+    };
+
+    const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const textOf = (el) => normalize(el.innerText || el.textContent || '');
+    const labelOf = (el) => normalize([
+      el.getAttribute('aria-label') || '',
+      el.getAttribute('title') || '',
+      el.getAttribute('data-testid') || '',
+      el.innerText || '',
+      el.textContent || '',
+    ].join(' '));
+
+    // Prefer the butterbar "Turn on" control when present.
+    const targets = [];
+    const butterbar = document.querySelector('[data-testid="chat-butterbar"]');
+    if (butterbar) {
+      const btn = butterbar.querySelector('button, [role="button"]') || butterbar;
+      targets.push(btn);
+    }
+    for (const el of document.querySelectorAll('button, [role="button"], div[role="button"]')) {
+      targets.push(el);
+    }
+
+    const seen = new Set();
+    for (const el of targets) {
+      if (!el || seen.has(el)) continue;
+      seen.add(el);
+      const rect = el.getBoundingClientRect?.() || { width: 0, height: 0 };
+      if (!(rect.width > 0 && rect.height > 0)) continue;
+
+      const text = textOf(el);
+      const label = labelOf(el) || text;
+      if (!label) continue;
+
+      // Avoid matching "Turn on" buried inside long unrelated labels without the notification context.
+      const isExactTurnOn = /^turn on$/i.test(text) || /^turn on$/i.test(label);
+      const isNotificationTurnOn = (
+        /\bturn on\b/i.test(label)
+        && /notification/i.test(label)
+      );
+      const isTurnOn = (
+        isExactTurnOn
+        || isNotificationTurnOn
+        || /turn on desktop notifications/i.test(label)
+        || /enable (desktop )?notifications/i.test(label)
+        || /aktifkan notifikasi/i.test(label)
+        || /nyalakan notifikasi/i.test(label)
+      );
+      if (!isTurnOn) continue;
+
+      // Never click dismiss-style controls.
+      if (/\b(close|not now|dismiss|maybe later|nanti|tutup)\b/i.test(label) && !isExactTurnOn) continue;
+
+      result.candidates.push(label.slice(0, 100));
+      try {
+        el.scrollIntoView?.({ block: 'center', inline: 'center' });
+        el.focus?.();
+        el.click();
+        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        result.clicked.push({
+          action: 'turn-on',
+          label: label.slice(0, 100),
+          text: text.slice(0, 80),
+          testId: el.getAttribute('data-testid') || null,
+        });
+      } catch (error) {
+        result.clicked.push({ action: 'turn-on', error: error.message, label: label.slice(0, 100) });
+      }
+    }
+    return result;
+  });
+}
+
+async function captureCallDebugScreenshot(tag = 'call') {
+  try {
+    const file = path.join(paths.state, `debug-${tag}-${Date.now()}.png`);
+    await client.pupPage.screenshot({ path: file, fullPage: false });
+    return file;
+  } catch (error) {
+    return `screenshot-failed: ${error.message}`;
+  }
+}
+
+async function dumpCallUiSnapshot() {
+  return await client.pupPage.evaluate(() => {
+    const nodes = Array.from(document.querySelectorAll('button, [role="button"], div[role="button"], span[data-icon], [data-testid]'));
+    const buttons = nodes.map((el) => {
+      const rect = el.getBoundingClientRect?.() || { x: 0, y: 0, width: 0, height: 0 };
+      return {
+        tag: el.tagName,
+        ariaLabel: el.getAttribute('aria-label') || '',
+        title: el.getAttribute('title') || '',
+        dataTestId: el.getAttribute('data-testid') || '',
+        dataIcon: el.getAttribute('data-icon') || el.querySelector?.('[data-icon]')?.getAttribute('data-icon') || '',
+        text: (el.innerText || el.textContent || '').trim().slice(0, 80),
+        visible: rect.width > 0 && rect.height > 0,
+        x: Math.round(rect.x || 0),
+        y: Math.round(rect.y || 0),
+      };
+    }).filter((b) => b.visible).slice(0, 120);
+
+    let callState = null;
+    try {
+      const CC = window.require('WAWebCallCollection');
+      const active = CC?.lastActiveCall || null;
+      const mapKey = Object.keys(CC || {}).find((k) => CC[k] instanceof Map);
+      const mapSize = mapKey ? CC[mapKey].size : null;
+      callState = {
+        isInConnectedCall: Boolean(CC?.isInConnectedCall),
+        pendingOfferCount: CC?.pendingOffers ? Object.keys(CC.pendingOffers).length : 0,
+        mapSize,
+        lastActiveCall: active ? {
+          id: active.id,
+          peerJid: active.peerJid,
+          state: active.state,
+          canHandleLocally: active.canHandleLocally,
+          webClientShouldHandle: active.webClientShouldHandle,
+        } : null,
+      };
+    } catch (error) {
+      callState = { error: error.message };
+    }
+
+    // Also capture any visible text that looks like an incoming call toast/banner.
+    const bodyText = (document.body?.innerText || '').slice(0, 1500);
+    return { buttons, callState, href: location.href, bodyTextSnippet: bodyText };
+  });
+}
+
+async function getCallConnectionState() {
+  return await client.pupPage.evaluate(() => {
+    try {
+      const CC = window.require('WAWebCallCollection');
+      const active = CC?.lastActiveCall || null;
+      return {
+        isInConnectedCall: Boolean(CC?.isInConnectedCall),
+        pendingOfferCount: CC?.pendingOffers ? Object.keys(CC.pendingOffers).length : 0,
+        lastActiveCallId: active?.id || null,
+        lastActiveCallState: active?.state || null,
+        peerJid: active?.peerJid || null,
+      };
+    } catch (error) {
+      return { error: error.message, isInConnectedCall: false };
+    }
+  });
+}
+
+async function clickMatchingButtons(matchers, { maxClicks = 2, exclude = [] } = {}) {
+  return await client.pupPage.evaluate((patterns, limit, excludePatterns) => {
+    const regexes = patterns.map((p) => new RegExp(p, 'i'));
+    const excludeRes = excludePatterns.map((p) => new RegExp(p, 'i'));
+    const selectors = [
+      'button',
+      '[role="button"]',
+      'div[role="button"]',
+      '[data-testid]',
+      'span[data-icon]',
+      'div[aria-label]',
+    ].join(',');
+    const candidates = Array.from(document.querySelectorAll(selectors));
+    const clicked = [];
+    const scanned = [];
+
+    for (const el of candidates) {
+      const rect = el.getBoundingClientRect?.() || { width: 0, height: 0 };
+      if (!(rect.width > 0 && rect.height > 0)) continue;
+
+      const label = [
+        el.getAttribute('aria-label') || '',
+        el.getAttribute('title') || '',
+        el.getAttribute('data-testid') || '',
+        el.getAttribute('data-icon') || '',
+        el.querySelector?.('[data-icon]')?.getAttribute('data-icon') || '',
+        el.innerText || '',
+        el.textContent || '',
+      ].join(' ').replace(/\s+/g, ' ').trim();
+
+      if (!label) continue;
+      if (excludeRes.some((re) => re.test(label))) continue;
+      if (!regexes.some((re) => re.test(label))) continue;
+
+      scanned.push(label.slice(0, 120));
+      if (clicked.length >= limit) continue;
+      try {
+        el.scrollIntoView?.({ block: 'center', inline: 'center' });
+        el.click();
+        // Also dispatch pointer events for React handlers that ignore plain click.
+        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+        el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        clicked.push({
+          label: label.slice(0, 120),
+          dataTestId: el.getAttribute('data-testid') || null,
+          dataIcon: el.getAttribute('data-icon') || el.querySelector?.('[data-icon]')?.getAttribute('data-icon') || null,
+        });
+      } catch (error) {
+        clicked.push({ label: label.slice(0, 120), error: error.message });
+      }
+    }
+    return { clicked, scanned: scanned.slice(0, 20), candidateCount: candidates.length };
+  }, matchers, maxClicks, exclude);
+}
+
+async function rejectActiveCall(callInfo = lastCall) {
+  if (!callInfo) return { success: false, error: 'No active call to reject.' };
+  try {
+    if (typeof callInfo.reject === 'function') {
+      await callInfo.reject();
+      log.info('call-rejected', { id: callInfo.id, from: callInfo.from, method: 'library' });
+      return { success: true, method: 'library', rejectedCall: lastCall };
+    }
+  } catch (error) {
+    log.debug('call-reject-library-failed', error.message);
+  }
+
+  const ui = await clickMatchingButtons(['decline', 'reject', 'tolak', 'end call', 'akhiri'], { maxClicks: 2 });
+  log.info('call-rejected', { id: callInfo.id, from: callInfo.from, method: 'ui', ui });
+  return { success: ui.clicked.length > 0, method: 'ui', ui, rejectedCall: lastCall };
+}
+
+async function hangupActiveCall() {
+  const ui = await clickMatchingButtons([
+    'end call',
+    'hang up',
+    'leave',
+    'akhiri panggilan',
+    'akhiri',
+    'end',
+  ], { maxClicks: 3 });
+
+  // Fallback: try internal call model end/leave methods if present.
+  const internal = await client.pupPage.evaluate(() => {
+    const attempts = [];
+    try {
+      const CC = window.require('WAWebCallCollection');
+      const active = CC?.lastActiveCall || null;
+      if (active) {
+        for (const name of ['end', 'hangup', 'leave', 'reject', 'cancel']) {
+          if (typeof active[name] === 'function') {
+            try {
+              active[name]();
+              attempts.push({ method: name, success: true });
+            } catch (error) {
+              attempts.push({ method: name, error: error.message });
+            }
+          }
+        }
+      }
+    } catch (error) {
+      attempts.push({ method: 'WAWebCallCollection', error: error.message });
+    }
+    return attempts;
+  });
+
+  const success = ui.clicked.length > 0 || internal.some((item) => item.success);
+  if (activeBotCall) {
+    activeBotCall = {
+      ...activeBotCall,
+      status: success ? 'hung-up' : 'hangup-failed',
+      hungUpAt: new Date().toISOString(),
+      hangup: { ui, internal },
+    };
+  }
+  logJson('info', 'call-hangup', { success, ui, internal });
+  return { success, ui, internal };
+}
+
+async function tryInternalAccept(callInfo) {
+  // Only invoke real accept/answer methods on the call model.
+  // Do NOT send raw WAWap accept stanzas — signal-only accept kills the ring/popup
+  // without establishing media, which makes the incoming-call UI disappear.
+  return await client.pupPage.evaluate((callId) => {
+    const attempts = [];
+    try {
+      const Store = window.Store || {};
+      const callCollection = Store.Call || window.require?.('WAWebCallCollection');
+      const active = callCollection?.lastActiveCall
+        || callCollection?.get?.(callId)
+        || (callCollection?._models || []).find?.((c) => c?.id === callId)
+        || null;
+      if (active) {
+        const call = active;
+        for (const name of ['accept', 'answer', 'join', 'offerAccept']) {
+          if (typeof call[name] === 'function') {
+            try {
+              call[name]();
+              attempts.push({ method: `call.${name}()`, success: true });
+            } catch (error) {
+              attempts.push({ method: `call.${name}()`, error: error.message });
+            }
+          }
+        }
+        attempts.push({
+          method: 'call.methods',
+          available: Object.getOwnPropertyNames(Object.getPrototypeOf(call))
+            .filter((k) => typeof call[k] === 'function')
+            .slice(0, 40),
+        });
+      } else {
+        attempts.push({ method: 'Store.Call', error: 'no active call model' });
+      }
+    } catch (error) {
+      attempts.push({ method: 'Store.Call', error: error.message });
+    }
+    return attempts;
+  }, callInfo.id);
+}
+
+async function waitForConnectedCall({ timeoutMs = 8000 } = {}) {
+  const started = Date.now();
+  let last = null;
+  while (Date.now() - started < timeoutMs) {
+    last = await getCallConnectionState();
+    if (last?.isInConnectedCall) return { connected: true, state: last };
+    // State names vary; treat common connected labels as success.
+    if (typeof last?.lastActiveCallState === 'string'
+      && /connected|active|ongoing|in_call|accepted/i.test(last.lastActiveCallState)) {
+      return { connected: true, state: last };
+    }
+    await sleep(400);
+  }
+  return { connected: false, state: last };
+}
+
+async function acceptIncomingCall(callInfo, { hangupAfterAudio = true } = {}) {
+  if (!callInfo) return { success: false, error: 'No active call to accept.' };
+  if (botCallInFlight) return { success: false, error: 'Another bot call is already in progress.', activeBotCall };
+
+  botCallInFlight = true;
+  const startedAt = new Date().toISOString();
+  activeBotCall = {
+    id: callInfo.id,
+    from: callInfo.from,
+    isVideo: Boolean(callInfo.isVideo),
+    isGroup: Boolean(callInfo.isGroup),
+    status: 'accepting',
+    botAudioPath,
+    startedAt,
+    headless: voiceBotHeadless,
+  };
+
+  try {
+    // Goal: preserve the incoming-call popup, then click Accept only.
+    // Do NOT body-click, do NOT send signal-only accept stanzas, do NOT open settings drawers.
+    await focusWhatsAppWindow({ clickBody: false });
+
+    // Unlock only if a real Chat Lock / secret-code field is already visible.
+    // Never force-unlock or touch search during an active ring.
+    let chatLock = null;
+    try {
+      chatLock = await unlockChatLockPrompt({ force: false });
+      logJson('info', 'call-chat-lock-unlock', {
+        success: chatLock?.success || false,
+        configured: chatLock?.configured || false,
+        filled: chatLock?.filled || false,
+        stillLocked: chatLock?.stillLocked ?? null,
+        skipped: chatLock?.skipped || false,
+        reason: chatLock?.reason || null,
+      });
+    } catch (error) {
+      chatLock = { success: false, error: error.message };
+      logJson('error', 'call-chat-lock-unlock-failed', { error: error.message });
+    }
+
+    // Give WhatsApp time to paint the ring UI before any scanning/clicking.
+    await sleep(800);
+    const beforeUi = await dumpCallUiSnapshot();
+    const beforeShot = await captureCallDebugScreenshot('before-accept');
+    logJson('info', 'call-ui-before-accept', {
+      callState: beforeUi.callState,
+      interestingButtons: (beforeUi.buttons || []).filter((b) => /accept|decline|answer|reject|call|phone|tolak|terima/i.test(`${b.ariaLabel} ${b.text} ${b.dataTestId} ${b.dataIcon}`)),
+      buttonCount: (beforeUi.buttons || []).length,
+      screenshot: beforeShot,
+      bodyTextSnippet: beforeUi.bodyTextSnippet,
+      chatLock,
+    });
+
+    // Strict Accept matchers only — never Decline/Close/Turn on.
+    const acceptMatchers = [
+      '^accept$',
+      '^answer$',
+      'accept call',
+      'answer call',
+      '^terima$',
+      '^angkat$',
+      'voice call accept',
+      'video call accept',
+      'call-accept',
+      'accept-call',
+      'answer-call',
+      'phone-accept',
+      'ic-accept',
+      'accept-phone',
+      'wds-ic-phone-accept',
+      'wds-ic-videocall-accept',
+      'call-incoming-accept',
+    ];
+    const excludeMatchers = [
+      'decline',
+      'reject',
+      'tolak',
+      'end call',
+      'hang up',
+      'akhiri',
+      'cancel',
+      'close',
+      'turn on',
+      'notification',
+      'mute',
+    ];
+
+    let acceptUi = { clicked: [], scanned: [], candidateCount: 0 };
+    let connected = { connected: false, state: null };
+    let internal = [];
+    const notif = { skipped: true, reason: 'not-touched-during-incoming-call' };
+
+    // Poll for Accept button and click it when visible. No body-click. No WAWap stanza.
+    for (let attempt = 1; attempt <= 20; attempt += 1) {
+      // Soft focus only (no body click) so the toast/popup stays up.
+      if (attempt === 1 || attempt % 5 === 0) {
+        await focusWhatsAppWindow({ clickBody: false });
+      }
+
+      acceptUi = await clickMatchingButtons(acceptMatchers, {
+        maxClicks: 1,
+        exclude: excludeMatchers,
+      });
+      logJson('info', 'call-accept-click-attempt', { attempt, acceptUi });
+
+      if (acceptUi.clicked.length > 0) {
+        // Only after a real Accept UI click, wait for connected media.
+        connected = await waitForConnectedCall({ timeoutMs: 5000 });
+        if (connected.connected) break;
+
+        // If UI was clicked but model still not connected, try real model methods once.
+        // Still no raw WAWap signal-only stanza.
+        internal = await tryInternalAccept(callInfo);
+        logJson('info', 'call-accept-internal-after-ui', { attempt, internal });
+        connected = await waitForConnectedCall({ timeoutMs: 3000 });
+        if (connected.connected) break;
+      }
+
+      // Keep waiting for Accept UI — do not dismiss popup while ringing.
+      await sleep(700);
+    }
+
+    // Last resort: real model accept methods only, and only if UI never appeared.
+    if (!connected.connected && acceptUi.clicked.length === 0) {
+      internal = await tryInternalAccept(callInfo);
+      logJson('info', 'call-accept-internal-last-resort', { internal });
+      connected = await waitForConnectedCall({ timeoutMs: 2500 });
+    }
+
+    const afterUi = await dumpCallUiSnapshot();
+    const afterShot = await captureCallDebugScreenshot(connected.connected ? 'accepted' : 'accept-failed');
+    const accepted = Boolean(connected.connected);
+    activeBotCall = {
+      ...activeBotCall,
+      status: accepted ? 'accepted' : 'accept-failed',
+      acceptedAt: new Date().toISOString(),
+      accept: {
+        ui: acceptUi,
+        internal,
+        connected,
+        notificationPrompt: notif,
+        chatLock,
+        screenshots: { before: beforeShot, after: afterShot },
+        beforeUi: {
+          callState: beforeUi.callState,
+          interestingButtons: (beforeUi.buttons || []).filter((b) => /accept|decline|answer|reject|call|phone|tolak|terima/i.test(`${b.ariaLabel} ${b.text} ${b.dataTestId} ${b.dataIcon}`)),
+        },
+        afterUi: {
+          callState: afterUi.callState,
+          interestingButtons: (afterUi.buttons || []).filter((b) => /accept|decline|answer|reject|call|phone|tolak|terima/i.test(`${b.ariaLabel} ${b.text} ${b.dataTestId} ${b.dataIcon}`)),
+        },
+      },
+    };
+    logJson('info', 'call-accept-attempt', activeBotCall);
+
+    if (!accepted) {
+      return {
+        success: false,
+        error: 'Call was detected but Accept UI was not clicked/connected. Popup is preserved (no dismiss/body-click/signal-only accept).',
+        call: activeBotCall,
+      };
+    }
+
+    // Chrome fake-mic WAV starts when getUserMedia opens after accept.
+    let hangup = null;
+    if (hangupAfterAudio) {
+      const audioMs = await getWavDurationMs(botAudioPath);
+      const waitMs = audioMs + botHangupPaddingMs;
+      activeBotCall = { ...activeBotCall, status: 'playing-bot-audio', waitMs, audioMs };
+      logJson('info', 'call-bot-audio-wait', { audioMs, waitMs, botAudioPath });
+      await sleep(waitMs);
+      hangup = await hangupActiveCall();
+      activeBotCall = {
+        ...activeBotCall,
+        status: hangup.success ? 'completed' : 'hangup-failed',
+        completedAt: new Date().toISOString(),
+        hangup,
+      };
+      logJson('info', 'call-bot-complete', activeBotCall);
+    }
+
+    return {
+      success: true,
+      call: activeBotCall,
+      botAudioPath,
+      note: 'Bot audio is injected as Chrome fake microphone. Swap file via WHATSAPP_BOT_AUDIO and restart daemon.',
+    };
+  } catch (error) {
+    activeBotCall = {
+      ...(activeBotCall || {}),
+      status: 'error',
+      error: error.message,
+      failedAt: new Date().toISOString(),
+    };
+    logJson('error', 'call-accept-failed', { error: error.message, call: activeBotCall });
+    return { success: false, error: error.message, call: activeBotCall };
+  } finally {
+    botCallInFlight = false;
+  }
+}
+
+// Incoming call detection + optional auto-accept voice bot.
+client.on('call', async (call) => {
+  // Ignore duplicate/stale call events while a bot flow is already running.
+  if (botCallInFlight && lastCall?.id === call.id) {
+    logJson('info', 'incoming-call-duplicate-ignored', { id: call.id, from: call.from });
+    return;
+  }
+
+  lastCall = {
+    id: call.id,
+    from: call.from,
+    isVideo: call.isVideo,
+    isGroup: call.isGroup,
+    canHandleLocally: call.canHandleLocally,
+    webClientShouldHandle: call.webClientShouldHandle,
+    timestamp: new Date().toISOString(),
+    // Keep library reject helper for later use.
+    reject: typeof call.reject === 'function' ? call.reject.bind(call) : null,
+  };
+  logJson('info', 'incoming-call', {
+    id: lastCall.id,
+    from: lastCall.from,
+    isVideo: lastCall.isVideo,
+    isGroup: lastCall.isGroup,
+    canHandleLocally: lastCall.canHandleLocally,
+    webClientShouldHandle: lastCall.webClientShouldHandle,
+    autoAcceptCalls,
+    headless: voiceBotHeadless,
+  });
+
+  if (!autoAcceptCalls) return;
+  if (call.fromMe) return;
+  // Fire-and-forget so the event handler doesn't block other call updates.
+  void acceptIncomingCall(lastCall, { hangupAfterAudio: true });
 });
 
 async function socketIsActive() {
@@ -1356,6 +2536,17 @@ async function shutdown(signal, exitCode = 0) {
 
 async function main() {
   log.info('start', `chrome=${chromePath}`);
+  logJson('info', 'voice-bot-config', {
+    autoAcceptCalls,
+    botAudioPath,
+    botHangupPaddingMs,
+    headless: voiceBotHeadless,
+  });
+  try {
+    await lstat(botAudioPath);
+  } catch (error) {
+    log.error('voice-bot-audio-missing', `${botAudioPath}: ${error.message}`);
+  }
   await ensurePrivateDirectories();
   await removeQr();
   const persistedLedger = await readJson(paths.sendLedger, { outcomes: [] });
