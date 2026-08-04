@@ -26,6 +26,17 @@ import {
   writeJsonAtomic,
 } from './lib/core.mjs';
 
+import {
+  deepProbeVoipStack,
+  installCallBridge,
+  patchIncomingCallListener,
+  playBotAudioBase64,
+  probeCallBridge,
+  voipAcceptCall,
+  voipEndCall,
+  voipRejectCall,
+} from './lib/call-bridge.mjs';
+
 // Prefer CLI --account, then WHATSAPP_ACCOUNT_ID from LaunchAgent/env.
 // LaunchAgent historically only set the env var (no CLI flag); without this fallback
 // the daemon bound the legacy root paths and ignored per-account auth/state.
@@ -80,20 +91,32 @@ const activeSockets = new Set();
 const sendOutcomes = new Map();
 const acknowledgementHistory = new Map();
 
-// Experimental voice-bot settings. Audio is injected as Chrome's fake microphone
-// (--use-file-for-fake-audio-capture). Change file via WHATSAPP_BOT_AUDIO.
-// Disable auto-accept with WHATSAPP_AUTO_ACCEPT_CALLS=0.
+// Experimental voice-bot settings (all toggles are env-based; restart daemon after change).
+//
+// ON/OFF switches:
+//   WHATSAPP_AUTO_ACCEPT_CALLS=0   → detect only, do not auto-answer
+//   WHATSAPP_BOT_AUDIO_INJECT=0    → accept without WebAudio mic inject / greeting play
+//   WHATSAPP_BOT_HANGUP_AFTER_AUDIO=0 → leave call open after accept (no auto hangup)
+//   WHATSAPP_HEADLESS=1            → Chrome --headless=new (no visible window)
+//
+// Audio file:
+//   WHATSAPP_BOT_AUDIO=/abs/path.wav  (PCM WAV only; sibling .m4a is preview-only)
+// Chrome also gets --use-file-for-fake-audio-capture as a fallback, but real peer
+// audio requires WebAudio inject into the patched getUserMedia stream (bridge v6+).
 const defaultBotAudio = path.join(sourceRoot, 'assets/audio/bot-greeting-id.wav');
 const botAudioPath = process.env.WHATSAPP_BOT_AUDIO
   ? path.resolve(process.env.WHATSAPP_BOT_AUDIO)
   : defaultBotAudio;
 const autoAcceptCalls = process.env.WHATSAPP_AUTO_ACCEPT_CALLS !== '0';
+const botAudioInject = process.env.WHATSAPP_BOT_AUDIO_INJECT !== '0';
+const botHangupAfterAudio = process.env.WHATSAPP_BOT_HANGUP_AFTER_AUDIO !== '0';
 // Headed Chrome is more reliable for WhatsApp call UI + WebRTC accept.
-// Set WHATSAPP_HEADLESS=1 to force pure headless again.
+// Set WHATSAPP_HEADLESS=1 to force pure headless again (validated working with VoIP-first).
 const voiceBotHeadless = process.env.WHATSAPP_HEADLESS === '1'
   ? true
   : (autoAcceptCalls ? false : true);
-const botHangupPaddingMs = Number(process.env.WHATSAPP_BOT_HANGUP_PADDING_MS || 1500);
+// After greeting finishes, wait this long then hang up (default 800ms).
+const botHangupPaddingMs = Number(process.env.WHATSAPP_BOT_HANGUP_PADDING_MS || 800);
 let lastCall = null;
 let activeBotCall = null;
 let botCallInFlight = false;
@@ -793,6 +816,31 @@ async function finalizeReady(source) {
     await publishState();
     await writeCompatibilitySnapshot();
     log.info('ready', `source=${source} chatCount=${chats.length}`);
+// Install experimental call bridge on every ready path (library-event AND
+    // operational-probe). Without this, operational-probe ready skips the
+    // client.on('ready') handler and only installs on first accept attempt.
+    try {
+      const bridge = await installCallBridge(client.pupPage);
+      const listener = await patchIncomingCallListener(client.pupPage);
+      const probe = await probeCallBridge(client.pupPage);
+      logJson('info', 'call-bridge-ready', {
+        source,
+        bridge,
+        listener,
+        probeSummary: {
+          installed: probe?.installed,
+          version: probe?.version,
+          gating: probe?.gating || null,
+          modules: probe?.modules
+            ? Object.fromEntries(
+              Object.entries(probe.modules).map(([k, v]) => [k, { ok: v.ok, error: v.error || null }]),
+            )
+            : null,
+        },
+      });
+    } catch (bridgeError) {
+      logJson('error', 'call-bridge-install-failed', { source, error: bridgeError.message });
+    }
 
     if (!healthTimer) {
       healthTimer = setInterval(async () => {
@@ -1063,17 +1111,52 @@ async function dispatch(method, params = {}) {
     };
   }
 
+
+  if (method === 'deepProbeVoipStack') {
+    try {
+      await installCallBridge(client.pupPage);
+      return await deepProbeVoipStack(client.pupPage);
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
   if (method === 'getCallBotConfig') {
     return {
       autoAcceptCalls,
+      botAudioInject,
+      botHangupAfterAudio,
       botAudioPath,
       botHangupPaddingMs,
       headless: voiceBotHeadless,
-      canChangeAudio: 'Set WHATSAPP_BOT_AUDIO to another WAV path and restart the daemon.',
+      toggles: {
+        autoAccept: 'WHATSAPP_AUTO_ACCEPT_CALLS=0 to disable auto-answer (detect only). Default on.',
+        audioInject: 'WHATSAPP_BOT_AUDIO_INJECT=0 to accept without greeting inject. Default on.',
+        hangupAfterAudio: 'WHATSAPP_BOT_HANGUP_AFTER_AUDIO=0 to keep call open after accept/play. Default on.',
+        audioFile: 'WHATSAPP_BOT_AUDIO=/abs/path.wav (PCM). Restart daemon after change.',
+        hangupPaddingMs: 'WHATSAPP_BOT_HANGUP_PADDING_MS=800 (ms after audio before hangup).',
+        headless: 'WHATSAPP_HEADLESS=1 for invisible Chrome (LaunchAgent default).',
+      },
+      canChangeAudio: 'Set WHATSAPP_BOT_AUDIO to another WAV (PCM) path and restart the daemon. m4a/mp3 not supported by Chrome fake mic.',
       disableAutoAccept: 'Set WHATSAPP_AUTO_ACCEPT_CALLS=0 and restart the daemon.',
-      forceHeadless: 'Set WHATSAPP_HEADLESS=1 to force headless (less reliable for accept UI).',
-      note: 'Desktop notification banner is ENABLED via "Turn on" (never closed). Browser notification permission is also granted. Auto-accept still needs WhatsApp Web to render Accept call controls.',
+      disableAudioInject: 'Set WHATSAPP_BOT_AUDIO_INJECT=0 and restart the daemon.',
+      forceHeadless: 'Set WHATSAPP_HEADLESS=1 to force headless Chrome (no visible window).',
+      note: 'Call accept: VoIP-first stack.acceptCall(unmute,enableVideo) + WebAudio mic inject (bridge v6+). No raw WAWap accept stanza.',
+      research: {
+        wwebjs_201825: 'https://github.com/wwebjs/whatsapp-web.js/pull/201825',
+        wwebjs_201881: 'https://github.com/wwebjs/whatsapp-web.js/pull/201881',
+        wppconnect_2521: 'https://github.com/wppconnect-team/wppconnect-server/pull/2521',
+      },
     };
+  }
+
+  if (method === 'probeCallBridge') {
+    try {
+      await installCallBridge(client.pupPage);
+      await patchIncomingCallListener(client.pupPage);
+      return await probeCallBridge(client.pupPage);
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
   }
 
   if (method === 'rejectCall') {
@@ -1088,7 +1171,9 @@ async function dispatch(method, params = {}) {
 
   if (method === 'exploreCallApi') {
     try {
-      return await inspectCallApi();
+      const legacy = await inspectCallApi();
+      const bridge = await probeCallBridge(client.pupPage);
+      return { legacy, bridge };
     } catch (err) {
       return { error: err.message };
     }
@@ -1446,6 +1531,9 @@ client.on('ready', async () => {
     const permission = await ensureDesktopNotificationPermission();
     const notif = await enableDesktopNotifications();
     logJson('info', 'ready-enable-notifications', { permission, notif });
+
+    // Call bridge install lives in finalizeReady so operational-probe ready
+    // (the common path) also gets the VoIP helpers + activeCall listener.
     await finalizeReady('library-event');
   } catch (error) {
     log.error('ready-finalization-failed', truncateText(error?.message || String(error), 300));
@@ -2064,13 +2152,16 @@ async function getCallConnectionState() {
   return await client.pupPage.evaluate(() => {
     try {
       const CC = window.require('WAWebCallCollection');
-      const active = CC?.lastActiveCall || null;
+      const active = CC?.activeCall || CC?.lastActiveCall || null;
+      const state = active
+        ? (typeof active.getState === 'function' ? active.getState() : (active.state ?? null))
+        : null;
       return {
         isInConnectedCall: Boolean(CC?.isInConnectedCall),
         pendingOfferCount: CC?.pendingOffers ? Object.keys(CC.pendingOffers).length : 0,
         lastActiveCallId: active?.id || null,
-        lastActiveCallState: active?.state || null,
-        peerJid: active?.peerJid || null,
+        lastActiveCallState: state,
+        peerJid: active?.peerJid?._serialized || active?.peerJid || null,
       };
     } catch (error) {
       return { error: error.message, isInConnectedCall: false };
@@ -2136,6 +2227,16 @@ async function clickMatchingButtons(matchers, { maxClicks = 2, exclude = [] } = 
 
 async function rejectActiveCall(callInfo = lastCall) {
   if (!callInfo) return { success: false, error: 'No active call to reject.' };
+  // Prefer VoIP stack reject (PR #201825) over library WAWap reject stanza.
+  try {
+    const voip = await voipRejectCall(client.pupPage, { callId: callInfo?.id || lastCall?.id || null });
+    if (voip?.success) {
+      log.info('call-rejected', { id: callInfo.id, from: callInfo.from, method: 'voip-stack', voip });
+      return { success: true, method: 'voip-stack', voip, rejectedCall: lastCall };
+    }
+  } catch (error) {
+    log.debug('call-reject-voip-failed', error.message);
+  }
   try {
     if (typeof callInfo.reject === 'function') {
       await callInfo.reject();
@@ -2152,40 +2253,31 @@ async function rejectActiveCall(callInfo = lastCall) {
 }
 
 async function hangupActiveCall() {
-  const ui = await clickMatchingButtons([
-    'end call',
-    'hang up',
-    'leave',
-    'akhiri panggilan',
-    'akhiri',
-    'end',
-  ], { maxClicks: 3 });
+  // Prefer VoIP stack endCall first (PR #201825 / #201881). UI click is fallback only —
+  // broad matchers like "end" previously false-matched chat-list / wordmark nodes.
+  let internal = [];
+  try {
+    const voip = await voipEndCall(client.pupPage, { callId: lastCall?.id || activeBotCall?.id || null });
+    internal.push(voip);
+  } catch (error) {
+    internal.push({ method: 'voipEndCall', success: false, error: error.message });
+  }
 
-  // Fallback: try internal call model end/leave methods if present.
-  const internal = await client.pupPage.evaluate(() => {
-    const attempts = [];
-    try {
-      const CC = window.require('WAWebCallCollection');
-      const active = CC?.lastActiveCall || null;
-      if (active) {
-        for (const name of ['end', 'hangup', 'leave', 'reject', 'cancel']) {
-          if (typeof active[name] === 'function') {
-            try {
-              active[name]();
-              attempts.push({ method: name, success: true });
-            } catch (error) {
-              attempts.push({ method: name, error: error.message });
-            }
-          }
-        }
-      }
-    } catch (error) {
-      attempts.push({ method: 'WAWebCallCollection', error: error.message });
-    }
-    return attempts;
-  });
+  let ui = { clicked: [], scanned: [], candidateCount: 0 };
+  const voipOk = internal.some((item) => item && item.success);
+  if (!voipOk) {
+    ui = await clickMatchingButtons([
+      '^end call$',
+      '^hang up$',
+      'akhiri panggilan',
+      'end-call',
+      'ic-call-end',
+      'ic-call-end-filled',
+      'wds-ic-call-end',
+    ], { maxClicks: 1, exclude: ['send', 'document', 'notification', 'chat', 'list', 'wordmark', 'status'] });
+  }
 
-  const success = ui.clicked.length > 0 || internal.some((item) => item.success);
+  const success = voipOk || ui.clicked.length > 0;
   if (activeBotCall) {
     activeBotCall = {
       ...activeBotCall,
@@ -2194,49 +2286,24 @@ async function hangupActiveCall() {
       hangup: { ui, internal },
     };
   }
-  logJson('info', 'call-hangup', { success, ui, internal });
+  logJson('info', 'call-hangup', { success, ui, internal, reason: voipOk ? 'voip-first' : 'ui-fallback' });
   return { success, ui, internal };
 }
 
-async function tryInternalAccept(callInfo) {
-  // Only invoke real accept/answer methods on the call model.
-  // Do NOT send raw WAWap accept stanzas — signal-only accept kills the ring/popup
-  // without establishing media, which makes the incoming-call UI disappear.
-  return await client.pupPage.evaluate((callId) => {
-    const attempts = [];
-    try {
-      const Store = window.Store || {};
-      const callCollection = Store.Call || window.require?.('WAWebCallCollection');
-      const active = callCollection?.lastActiveCall
-        || callCollection?.get?.(callId)
-        || (callCollection?._models || []).find?.((c) => c?.id === callId)
-        || null;
-      if (active) {
-        const call = active;
-        for (const name of ['accept', 'answer', 'join', 'offerAccept']) {
-          if (typeof call[name] === 'function') {
-            try {
-              call[name]();
-              attempts.push({ method: `call.${name}()`, success: true });
-            } catch (error) {
-              attempts.push({ method: `call.${name}()`, error: error.message });
-            }
-          }
-        }
-        attempts.push({
-          method: 'call.methods',
-          available: Object.getOwnPropertyNames(Object.getPrototypeOf(call))
-            .filter((k) => typeof call[k] === 'function')
-            .slice(0, 40),
-        });
-      } else {
-        attempts.push({ method: 'Store.Call', error: 'no active call model' });
-      }
-    } catch (error) {
-      attempts.push({ method: 'Store.Call', error: error.message });
-    }
-    return attempts;
-  }, callInfo.id);
+async function tryInternalAccept(callInfo, { injectAudio = botAudioInject } = {}) {
+  // Port of wwebjs PR #201825 acceptCall via VoIP stack (see lib/call-bridge.mjs).
+  // Also tries alternate module names from PR #201881-style controller resolution.
+  // Never sends raw WAWap accept stanzas (dismiss ring / no media).
+  try {
+    const result = await voipAcceptCall(client.pupPage, {
+      callId: callInfo.id,
+      isVideo: Boolean(callInfo.isVideo),
+      injectAudio: Boolean(injectAudio),
+    });
+    return Array.isArray(result) ? result : [result];
+  } catch (error) {
+    return [{ method: 'voipAcceptCall', success: false, error: error.message }];
+  }
 }
 
 async function waitForConnectedCall({ timeoutMs = 8000 } = {}) {
@@ -2247,68 +2314,76 @@ async function waitForConnectedCall({ timeoutMs = 8000 } = {}) {
     if (last?.isInConnectedCall) return { connected: true, state: last };
     // State names vary; treat common connected labels as success.
     if (typeof last?.lastActiveCallState === 'string'
-      && /connected|active|ongoing|in_call|accepted/i.test(last.lastActiveCallState)) {
+      && /connected|active|ongoing|in_call|accepted|call_active|received_call|accept/i.test(last.lastActiveCallState)) {
       return { connected: true, state: last };
     }
+    // Numeric WA call states: non-zero / progressive states often mean in-call.
+    if (typeof last?.lastActiveCallState === 'number' && last.lastActiveCallState > 0) {
+      // Prefer isInConnectedCall, but accept mid-call numeric progress after accept.
+      if (last.lastActiveCallState >= 3) return { connected: true, state: last };
+    }
+    // Bridge connection helper may expose richer flags.
+    try {
+      const bridgeState = await client.pupPage.evaluate(() => window.__whatsealCallBridgeApi?.connectionState?.() || null);
+      if (bridgeState?.isInConnectedCall) return { connected: true, state: { ...last, bridgeState } };
+    } catch { /* ignore */ }
     await sleep(400);
   }
   return { connected: false, state: last };
 }
 
-async function acceptIncomingCall(callInfo, { hangupAfterAudio = true } = {}) {
+async function acceptIncomingCall(callInfo, {
+  hangupAfterAudio = botHangupAfterAudio,
+  injectAudio = botAudioInject,
+} = {}) {
   if (!callInfo) return { success: false, error: 'No active call to accept.' };
   if (botCallInFlight) return { success: false, error: 'Another bot call is already in progress.', activeBotCall };
 
   botCallInFlight = true;
   const startedAt = new Date().toISOString();
+  const shouldInject = Boolean(injectAudio);
+  const shouldHangupAfter = Boolean(hangupAfterAudio) && shouldInject;
   activeBotCall = {
     id: callInfo.id,
     from: callInfo.from,
     isVideo: Boolean(callInfo.isVideo),
     isGroup: Boolean(callInfo.isGroup),
+    canHandleLocally: callInfo.canHandleLocally,
+    webClientShouldHandle: callInfo.webClientShouldHandle,
     status: 'accepting',
     botAudioPath,
+    injectAudio: shouldInject,
+    hangupAfterAudio: shouldHangupAfter,
     startedAt,
     headless: voiceBotHeadless,
   };
 
   try {
-    // Goal: preserve the incoming-call popup, then click Accept only.
-    // Do NOT body-click, do NOT send signal-only accept stanzas, do NOT open settings drawers.
+    // STRICT USER RULES:
+    // - Do not dismiss / hide the incoming-call UI
+    // - Do not body-click, open settings, type secrets, or send signal-only stanzas
+    // - Prefer: click Accept only. Fallback: VoIP stack acceptCall (PR #201825 / #201881 port)
     await focusWhatsAppWindow({ clickBody: false });
-
-    // Unlock only if a real Chat Lock / secret-code field is already visible.
-    // Never force-unlock or touch search during an active ring.
-    let chatLock = null;
     try {
-      chatLock = await unlockChatLockPrompt({ force: false });
-      logJson('info', 'call-chat-lock-unlock', {
-        success: chatLock?.success || false,
-        configured: chatLock?.configured || false,
-        filled: chatLock?.filled || false,
-        stillLocked: chatLock?.stillLocked ?? null,
-        skipped: chatLock?.skipped || false,
-        reason: chatLock?.reason || null,
-      });
-    } catch (error) {
-      chatLock = { success: false, error: error.message };
-      logJson('error', 'call-chat-lock-unlock-failed', { error: error.message });
+      await installCallBridge(client.pupPage);
+      await patchIncomingCallListener(client.pupPage);
+    } catch (bridgeError) {
+      logJson('error', 'call-bridge-ensure-failed', { error: bridgeError.message });
     }
+    await sleep(600);
 
-    // Give WhatsApp time to paint the ring UI before any scanning/clicking.
-    await sleep(800);
     const beforeUi = await dumpCallUiSnapshot();
     const beforeShot = await captureCallDebugScreenshot('before-accept');
     logJson('info', 'call-ui-before-accept', {
+      callId: callInfo.id,
+      canHandleLocally: callInfo.canHandleLocally,
+      webClientShouldHandle: callInfo.webClientShouldHandle,
       callState: beforeUi.callState,
       interestingButtons: (beforeUi.buttons || []).filter((b) => /accept|decline|answer|reject|call|phone|tolak|terima/i.test(`${b.ariaLabel} ${b.text} ${b.dataTestId} ${b.dataIcon}`)),
       buttonCount: (beforeUi.buttons || []).length,
       screenshot: beforeShot,
-      bodyTextSnippet: beforeUi.bodyTextSnippet,
-      chatLock,
     });
 
-    // Strict Accept matchers only — never Decline/Close/Turn on.
     const acceptMatchers = [
       '^accept$',
       '^answer$',
@@ -2340,48 +2415,56 @@ async function acceptIncomingCall(callInfo, { hangupAfterAudio = true } = {}) {
       'turn on',
       'notification',
       'mute',
+      'missed',
+      'callback',
     ];
 
     let acceptUi = { clicked: [], scanned: [], candidateCount: 0 };
     let connected = { connected: false, state: null };
     let internal = [];
-    const notif = { skipped: true, reason: 'not-touched-during-incoming-call' };
 
-    // Poll for Accept button and click it when visible. No body-click. No WAWap stanza.
-    for (let attempt = 1; attempt <= 20; attempt += 1) {
-      // Soft focus only (no body click) so the toast/popup stays up.
-      if (attempt === 1 || attempt % 5 === 0) {
-        await focusWhatsAppWindow({ clickBody: false });
+    // Prefer VoIP accept immediately. Meta often disables web calling AB prop so
+    // the Accept UI never mounts; waiting 12s first makes the offer go stale.
+    // Never raw WAWap accept stanzas.
+    internal = await tryInternalAccept(callInfo, { injectAudio: shouldInject });
+    logJson('info', 'call-accept-voip-stack', {
+      internal,
+      reason: 'voip-first',
+      injectAudio: shouldInject,
+    });
+    const voipOk = internal.some((item) => item && item.success);
+    connected = await waitForConnectedCall({ timeoutMs: voipOk ? 15000 : 4000 });
+
+    // If VoIP did not connect, briefly poll for Accept UI (popup-safe, Accept-only).
+    if (!connected.connected) {
+      for (let attempt = 1; attempt <= 8; attempt += 1) {
+        acceptUi = await clickMatchingButtons(acceptMatchers, {
+          maxClicks: 1,
+          exclude: excludeMatchers,
+        });
+        logJson('info', 'call-accept-click-attempt', {
+          attempt,
+          clicked: acceptUi.clicked,
+          scanned: acceptUi.scanned,
+          candidateCount: acceptUi.candidateCount,
+        });
+        if (acceptUi.clicked.length > 0) {
+          connected = await waitForConnectedCall({ timeoutMs: 8000 });
+          if (connected.connected) break;
+        }
+        // One more VoIP attempt mid-ring if UI still missing.
+        if (attempt === 3 && !voipOk) {
+          internal = await tryInternalAccept(callInfo, { injectAudio: shouldInject });
+          logJson('info', 'call-accept-voip-stack', {
+            internal,
+            reason: 'voip-retry-mid-ui',
+            injectAudio: shouldInject,
+          });
+          connected = await waitForConnectedCall({ timeoutMs: 10000 });
+          if (connected.connected) break;
+        }
+        await sleep(500);
       }
-
-      acceptUi = await clickMatchingButtons(acceptMatchers, {
-        maxClicks: 1,
-        exclude: excludeMatchers,
-      });
-      logJson('info', 'call-accept-click-attempt', { attempt, acceptUi });
-
-      if (acceptUi.clicked.length > 0) {
-        // Only after a real Accept UI click, wait for connected media.
-        connected = await waitForConnectedCall({ timeoutMs: 5000 });
-        if (connected.connected) break;
-
-        // If UI was clicked but model still not connected, try real model methods once.
-        // Still no raw WAWap signal-only stanza.
-        internal = await tryInternalAccept(callInfo);
-        logJson('info', 'call-accept-internal-after-ui', { attempt, internal });
-        connected = await waitForConnectedCall({ timeoutMs: 3000 });
-        if (connected.connected) break;
-      }
-
-      // Keep waiting for Accept UI — do not dismiss popup while ringing.
-      await sleep(700);
-    }
-
-    // Last resort: real model accept methods only, and only if UI never appeared.
-    if (!connected.connected && acceptUi.clicked.length === 0) {
-      internal = await tryInternalAccept(callInfo);
-      logJson('info', 'call-accept-internal-last-resort', { internal });
-      connected = await waitForConnectedCall({ timeoutMs: 2500 });
     }
 
     const afterUi = await dumpCallUiSnapshot();
@@ -2395,8 +2478,6 @@ async function acceptIncomingCall(callInfo, { hangupAfterAudio = true } = {}) {
         ui: acceptUi,
         internal,
         connected,
-        notificationPrompt: notif,
-        chatLock,
         screenshots: { before: beforeShot, after: afterShot },
         beforeUi: {
           callState: beforeUi.callState,
@@ -2413,34 +2494,71 @@ async function acceptIncomingCall(callInfo, { hangupAfterAudio = true } = {}) {
     if (!accepted) {
       return {
         success: false,
-        error: 'Call was detected but Accept UI was not clicked/connected. Popup is preserved (no dismiss/body-click/signal-only accept).',
+        error: 'Accept UI not clicked / not connected. No UI-dismiss actions were used. Official wwebjs has reject-only; experimental path is voip-stack acceptCall (PR #201825).',
         call: activeBotCall,
       };
     }
 
-    // Chrome fake-mic WAV starts when getUserMedia opens after accept.
-    let hangup = null;
-    if (hangupAfterAudio) {
+    if (shouldHangupAfter) {
       const audioMs = await getWavDurationMs(botAudioPath);
-      const waitMs = audioMs + botHangupPaddingMs;
-      activeBotCall = { ...activeBotCall, status: 'playing-bot-audio', waitMs, audioMs };
-      logJson('info', 'call-bot-audio-wait', { audioMs, waitMs, botAudioPath });
-      await sleep(waitMs);
-      hangup = await hangupActiveCall();
+      activeBotCall = { ...activeBotCall, status: 'playing-bot-audio', audioMs, botAudioPath };
+      logJson('info', 'call-bot-audio-start', { audioMs, botAudioPath, injectAudio: shouldInject });
+
+      // Critical: Chrome fake-mic flag alone is not enough once we patch getUserMedia
+      // to a WebAudio destination (PR #201825 inject). Without feeding that graph,
+      // the peer hears silence. Decode the greeting WAV and play into the mic stream.
+      let playback = null;
+      try {
+        const wavBuf = await readFile(botAudioPath);
+        const base64 = wavBuf.toString('base64');
+        playback = await playBotAudioBase64(client.pupPage, base64);
+        logJson('info', 'call-bot-audio-played', { playback, botAudioPath, bytes: wavBuf.length });
+      } catch (error) {
+        playback = { success: false, error: error.message };
+        logJson('error', 'call-bot-audio-play-failed', { error: error.message, botAudioPath });
+      }
+
+      const playedMs = Number(playback?.durationMs || playback?.durationSec * 1000 || 0);
+      const waitMs = (playback?.success && playedMs > 0)
+        ? playedMs + botHangupPaddingMs
+        : audioMs + botHangupPaddingMs;
+      if (!(playback?.success && playedMs > 0)) {
+        await sleep(waitMs);
+      } else if (botHangupPaddingMs > 0) {
+        await sleep(botHangupPaddingMs);
+      }
+
+      const hangup = await hangupActiveCall();
       activeBotCall = {
         ...activeBotCall,
         status: hangup.success ? 'completed' : 'hangup-failed',
         completedAt: new Date().toISOString(),
+        waitMs,
+        playback,
         hangup,
       };
       logJson('info', 'call-bot-complete', activeBotCall);
+    } else {
+      activeBotCall = {
+        ...activeBotCall,
+        status: 'accepted',
+        completedAt: new Date().toISOString(),
+        note: shouldInject
+          ? 'Accepted with inject enabled but hangup-after-audio disabled; call left open.'
+          : 'Accepted without bot audio inject; call left open.',
+      };
+      logJson('info', 'call-accept-open', activeBotCall);
     }
 
     return {
       success: true,
       call: activeBotCall,
       botAudioPath,
-      note: 'Bot audio is injected as Chrome fake microphone. Swap file via WHATSAPP_BOT_AUDIO and restart daemon.',
+      injectAudio: shouldInject,
+      hangupAfterAudio: shouldHangupAfter,
+      note: shouldInject
+        ? 'Bot audio: WebAudio → patched getUserMedia destination (bridge v6+). VoIP-first accept.'
+        : 'Accepted without audio inject (WHATSAPP_BOT_AUDIO_INJECT=0 or injectAudio:false).',
     };
   } catch (error) {
     activeBotCall = {
@@ -2456,7 +2574,6 @@ async function acceptIncomingCall(callInfo, { hangupAfterAudio = true } = {}) {
   }
 }
 
-// Incoming call detection + optional auto-accept voice bot.
 client.on('call', async (call) => {
   // Ignore duplicate/stale call events while a bot flow is already running.
   if (botCallInFlight && lastCall?.id === call.id) {
@@ -2489,7 +2606,11 @@ client.on('call', async (call) => {
   if (!autoAcceptCalls) return;
   if (call.fromMe) return;
   // Fire-and-forget so the event handler doesn't block other call updates.
-  void acceptIncomingCall(lastCall, { hangupAfterAudio: true });
+  // inject/hangup follow WHATSAPP_BOT_AUDIO_INJECT + WHATSAPP_BOT_HANGUP_AFTER_AUDIO.
+  void acceptIncomingCall(lastCall, {
+    hangupAfterAudio: botHangupAfterAudio,
+    injectAudio: botAudioInject,
+  });
 });
 
 async function socketIsActive() {
@@ -2538,14 +2659,18 @@ async function main() {
   log.info('start', `chrome=${chromePath}`);
   logJson('info', 'voice-bot-config', {
     autoAcceptCalls,
+    botAudioInject,
+    botHangupAfterAudio,
     botAudioPath,
     botHangupPaddingMs,
     headless: voiceBotHeadless,
   });
-  try {
-    await lstat(botAudioPath);
-  } catch (error) {
-    log.error('voice-bot-audio-missing', `${botAudioPath}: ${error.message}`);
+  if (botAudioInject) {
+    try {
+      await lstat(botAudioPath);
+    } catch (error) {
+      log.error('voice-bot-audio-missing', `${botAudioPath}: ${error.message}`);
+    }
   }
   await ensurePrivateDirectories();
   await removeQr();
