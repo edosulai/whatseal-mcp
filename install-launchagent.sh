@@ -19,10 +19,28 @@ BASELINE_APPROVAL_HELPER="${STATE_DIR}/native-baseline-approval"
 VERBOSE=0
 ACTION="install"
 ACCOUNT_ID=""
+VOICE_DEBUG="${WHATSAPP_DEBUG:-0}"
+VOICE_AUTO_ACCEPT="${WHATSAPP_AUTO_ACCEPT_CALLS:-0}"
+VOICE_AUTO_ACCEPT_CALLERS="${WHATSAPP_AUTO_ACCEPT_CALLERS:-}"
+VOICE_BOT_AUDIO="${WHATSAPP_BOT_AUDIO:-}"
+VOICE_BOT_AUDIO_INJECT="${WHATSAPP_BOT_AUDIO_INJECT:-1}"
+VOICE_BOT_HANGUP_AFTER_AUDIO="${WHATSAPP_BOT_HANGUP_AFTER_AUDIO:-1}"
+VOICE_BOT_HANGUP_PADDING_MS="${WHATSAPP_BOT_HANGUP_PADDING_MS:-1500}"
 
 log() { printf '%s script=whatsapp-launchagent pid=%s event=%s detail=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$1" "${2:-}"; }
 vlog() { [[ "$VERBOSE" -eq 1 ]] && log "debug" "$*" || true; }
 fail() { log "error" "$*" >&2; exit 1; }
+xml_escape() {
+  printf '%s' "$1" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g' \
+    -e "s/'/\&apos;/g"
+}
+validate_boolean() {
+  [[ "$2" == "0" || "$2" == "1" ]] || fail "$1 must be 0 or 1"
+}
 usage() {
   cat <<'EOF'
 Usage: install-launchagent.sh [install|status|start|stop|restart|remove] [--account ID] [--verbose|-v]
@@ -53,6 +71,8 @@ for arg in "$@"; do
   prev_arg="$arg"
 done
 
+[[ -z "$ACCOUNT_ID" || "$ACCOUNT_ID" =~ ^[A-Za-z0-9._-]+$ ]] || fail "account ID may contain only letters, digits, dot, underscore, and hyphen"
+
 # Apply account-specific paths
 HTTP_PORT="${WHATSAPP_HTTP_PORT:-}"
 if [[ -n "$ACCOUNT_ID" ]]; then
@@ -65,6 +85,7 @@ if [[ -n "$ACCOUNT_ID" ]]; then
   APPROVAL_HELPER="${STATE_DIR}/native-approval"
   BASELINE_APPROVAL_HELPER="${STATE_DIR}/native-baseline-approval"
 fi
+[[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || fail "LaunchAgent label may contain only letters, digits, dot, underscore, and hyphen"
 
 # Port = 30000 + last 4 digits of account id (uses the last 4 digits of the account id):
 #   beta → 30001
@@ -78,6 +99,8 @@ if [[ -z "$HTTP_PORT" ]]; then
   last4="$(printf '%s' "$digits" | awk '{ s=$0; while (length(s)<4) s="0" s; print substr(s, length(s)-3) }')"
   HTTP_PORT=$((30000 + 10#$last4))
 fi
+[[ "$HTTP_PORT" =~ ^[0-9]+$ ]] || fail "WHATSAPP_HTTP_PORT must be an integer"
+(( HTTP_PORT >= 1 && HTTP_PORT <= 65535 )) || fail "WHATSAPP_HTTP_PORT must be between 1 and 65535"
 
 NODE_BIN="$(command -v node || true)"
 NPM_BIN="$(command -v npm || true)"
@@ -127,33 +150,63 @@ render_plist() {
   mkdir -p "$PLIST_DIR" "$STATE_DIR" "$LOG_DIR"
   chmod 700 "$STATE_DIR" "$LOG_DIR"
   local temporary="${PLIST}.$$.tmp"
+  local escaped_label escaped_node escaped_daemon escaped_account account_args
+  local escaped_home escaped_base_state escaped_base_root escaped_chrome escaped_approval escaped_http_port
+  local escaped_stdout escaped_stderr escaped_callers escaped_audio audio_entry
+  escaped_label="$(xml_escape "$LABEL")"
+  escaped_node="$(xml_escape "$NODE_BIN")"
+  escaped_daemon="$(xml_escape "$SCRIPT_DIR/daemon.mjs")"
+  escaped_account="$(xml_escape "$ACCOUNT_ID")"
+  escaped_home="$(xml_escape "$HOME")"
+  escaped_base_state="$(xml_escape "$BASE_STATE_DIR")"
+  escaped_base_root="$(xml_escape "$BASE_ROOT_DIR")"
+  escaped_chrome="$(xml_escape "$CHROME_PATH")"
+  escaped_approval="$(xml_escape "$APPROVAL_HELPER")"
+  escaped_http_port="$(xml_escape "$HTTP_PORT")"
+  escaped_stdout="$(xml_escape "$LOG_DIR/stdout.log")"
+  escaped_stderr="$(xml_escape "$LOG_DIR/stderr.log")"
+  escaped_callers="$(xml_escape "$VOICE_AUTO_ACCEPT_CALLERS")"
+  escaped_audio="$(xml_escape "$VOICE_BOT_AUDIO")"
+  account_args=""
+  if [[ -n "$ACCOUNT_ID" ]]; then
+    account_args="    <string>--account</string>
+    <string>${escaped_account}</string>"
+  fi
+  audio_entry=""
+  if [[ -n "$VOICE_BOT_AUDIO" ]]; then
+    audio_entry="    <key>WHATSAPP_BOT_AUDIO</key><string>${escaped_audio}</string>"
+  fi
   ( umask 077; cat >"$temporary" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>${LABEL}</string>
+  <key>Label</key><string>${escaped_label}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${NODE_BIN}</string>
-    <string>${SCRIPT_DIR}/daemon.mjs</string>
-$(if [[ -n "$ACCOUNT_ID" ]]; then printf '    <string>--account</string>\n    <string>%s</string>\n' "$ACCOUNT_ID"; fi)  </array>
+    <string>${escaped_node}</string>
+    <string>${escaped_daemon}</string>
+${account_args}
+  </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>HOME</key><string>${HOME}</string>
+    <key>HOME</key><string>${escaped_home}</string>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-    <key>WHATSAPP_AGENT_STATE</key><string>${BASE_STATE_DIR}</string>
-    <key>WHATSAPP_AGENT_ROOT</key><string>${BASE_ROOT_DIR}</string>
-    <key>WHATSAPP_CHROME_PATH</key><string>${CHROME_PATH}</string>
-    <key>WHATSAPP_APPROVAL_HELPER</key><string>${APPROVAL_HELPER}</string>
-    <key>WHATSAPP_ACCOUNT_ID</key><string>${ACCOUNT_ID}</string>
-    <key>WHATSAPP_HTTP_PORT</key><string>${HTTP_PORT}</string>
+    <key>WHATSAPP_AGENT_STATE</key><string>${escaped_base_state}</string>
+    <key>WHATSAPP_AGENT_ROOT</key><string>${escaped_base_root}</string>
+    <key>WHATSAPP_CHROME_PATH</key><string>${escaped_chrome}</string>
+    <key>WHATSAPP_APPROVAL_HELPER</key><string>${escaped_approval}</string>
+    <key>WHATSAPP_ACCOUNT_ID</key><string>${escaped_account}</string>
+    <key>WHATSAPP_HTTP_PORT</key><string>${escaped_http_port}</string>
+    <!-- Voice-bot defaults fail closed. Supply overrides only while rendering this private plist. -->
     <!-- Chrome is ALWAYS headless by default. Set WHATSAPP_DEBUG=1 only for testing/debugging. -->
-    <!-- <key>WHATSAPP_DEBUG</key><string>0</string> -->
-    <!-- Voice-bot toggles (set any to 0 to disable; reinstall/restart after edit). -->
-    <key>WHATSAPP_AUTO_ACCEPT_CALLS</key><string>1</string>
-    <key>WHATSAPP_BOT_AUDIO_INJECT</key><string>1</string>
-    <key>WHATSAPP_BOT_HANGUP_AFTER_AUDIO</key><string>1</string>
+    <key>WHATSAPP_DEBUG</key><string>${VOICE_DEBUG}</string>
+    <key>WHATSAPP_AUTO_ACCEPT_CALLS</key><string>${VOICE_AUTO_ACCEPT}</string>
+    <key>WHATSAPP_AUTO_ACCEPT_CALLERS</key><string>${escaped_callers}</string>
+  ${audio_entry}
+    <key>WHATSAPP_BOT_AUDIO_INJECT</key><string>${VOICE_BOT_AUDIO_INJECT}</string>
+    <key>WHATSAPP_BOT_HANGUP_AFTER_AUDIO</key><string>${VOICE_BOT_HANGUP_AFTER_AUDIO}</string>
+    <key>WHATSAPP_BOT_HANGUP_PADDING_MS</key><string>${VOICE_BOT_HANGUP_PADDING_MS}</string>
   </dict>
   <key>Umask</key><integer>63</integer>
   <key>RunAtLoad</key><true/>
@@ -161,8 +214,8 @@ $(if [[ -n "$ACCOUNT_ID" ]]; then printf '    <string>--account</string>\n    <s
   <dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Background</string>
-  <key>StandardOutPath</key><string>${LOG_DIR}/stdout.log</string>
-  <key>StandardErrorPath</key><string>${LOG_DIR}/stderr.log</string>
+  <key>StandardOutPath</key><string>${escaped_stdout}</string>
+  <key>StandardErrorPath</key><string>${escaped_stderr}</string>
 </dict>
 </plist>
 EOF
@@ -247,6 +300,16 @@ case "$ACTION" in
     [[ -n "$NODE_BIN" ]] || fail "node is required"
     [[ -n "$NPM_BIN" ]] || fail "npm is required"
     command -v swiftc >/dev/null 2>&1 || fail "swiftc is required for Touch ID approval"
+    validate_boolean "WHATSAPP_DEBUG" "$VOICE_DEBUG"
+    validate_boolean "WHATSAPP_AUTO_ACCEPT_CALLS" "$VOICE_AUTO_ACCEPT"
+    validate_boolean "WHATSAPP_BOT_AUDIO_INJECT" "$VOICE_BOT_AUDIO_INJECT"
+    validate_boolean "WHATSAPP_BOT_HANGUP_AFTER_AUDIO" "$VOICE_BOT_HANGUP_AFTER_AUDIO"
+    [[ "$VOICE_BOT_HANGUP_PADDING_MS" =~ ^[0-9]+$ ]] || fail "WHATSAPP_BOT_HANGUP_PADDING_MS must be a non-negative integer"
+    (( VOICE_BOT_HANGUP_PADDING_MS <= 60000 )) || fail "WHATSAPP_BOT_HANGUP_PADDING_MS must not exceed 60000"
+    if [[ -n "$VOICE_BOT_AUDIO" ]]; then
+      [[ "$VOICE_BOT_AUDIO" == /* ]] || fail "WHATSAPP_BOT_AUDIO must be an absolute path"
+      [[ -f "$VOICE_BOT_AUDIO" && ! -L "$VOICE_BOT_AUDIO" ]] || fail "WHATSAPP_BOT_AUDIO must be a regular non-symlink file"
+    fi
     [[ "$STATE_DIR" == /* && "$ROOT_DIR" == /* && "$CHROME_PATH" == /* ]] || fail "runtime override paths must be absolute"
     [[ -x "$CHROME_PATH" ]] || fail "Google Chrome is required at $CHROME_PATH"
     if is_loaded && { ! is_owned || ! loaded_is_owned; }; then fail "refusing to replace a loaded foreign LaunchAgent label: ${LABEL}"; fi

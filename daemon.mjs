@@ -1,8 +1,9 @@
 #!/usr/bin/env node
+import { createReadStream } from 'node:fs';
 import { chmod, lstat, readdir, readFile, readlink, rm } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { deflateSync } from 'node:zlib';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -26,6 +27,34 @@ import {
   writeJsonAtomic,
 } from './lib/core.mjs';
 
+import {
+  deepProbeVoipStack,
+  getBotAudioPlaybackState,
+  installCallBridge,
+  patchIncomingCallListener,
+  playBotAudioBase64,
+  playBotAudioUrl,
+  prepareBotCallMedia,
+  probeCallBridge,
+  selectCallAudioMode,
+  teardownBotCallMedia,
+  verifyBotCallTarget,
+  voipAcceptCall,
+  voipEndCall,
+  voipRejectCall,
+  waitForBotAudioEnd,
+} from './lib/call-bridge.mjs';
+
+import {
+  evaluateBotAudioLifecycle,
+  evaluateAutoAcceptCallPolicy,
+  isLidJid,
+  parseAutoAcceptCallers,
+  phoneFromPnJid,
+  serializePeerJid,
+} from './lib/call-policy.mjs';
+import { parseSingleByteRange } from './lib/call-audio.mjs';
+
 // Prefer CLI --account, then WHATSAPP_ACCOUNT_ID from LaunchAgent/env.
 // LaunchAgent historically only set the env var (no CLI flag); without this fallback
 // the daemon bound the legacy root paths and ignored per-account auth/state.
@@ -48,6 +77,8 @@ function resolveHttpPort(id = null) {
   return 30000 + Number.parseInt(last4, 10);
 }
 
+const httpPort = resolveHttpPort(accountId);
+
 process.umask(0o077);
 
 const { Client, LocalAuth, Location, MessageMedia } = whatsapp;
@@ -62,6 +93,9 @@ const sourceRoot = fileURLToPath(new URL('.', import.meta.url));
 const runtimeSourceFiles = [
   'daemon.mjs',
   'lib/core.mjs',
+  'lib/call-policy.mjs',
+  'lib/call-audio.mjs',
+  'lib/call-bridge.mjs',
   'mcp-server.mjs',
   'mcp-wrapper.sh',
   'cli.mjs',
@@ -80,21 +114,52 @@ const activeSockets = new Set();
 const sendOutcomes = new Map();
 const acknowledgementHistory = new Map();
 
-// Experimental voice-bot settings. Audio is injected as Chrome's fake microphone
-// (--use-file-for-fake-audio-capture). Change file via WHATSAPP_BOT_AUDIO.
-// Disable auto-accept with WHATSAPP_AUTO_ACCEPT_CALLS=0.
+// Experimental voice-bot settings (all toggles are env-based; restart daemon after change).
+//
+// ON/OFF switches:
+//   WHATSAPP_AUTO_ACCEPT_CALLS=1   → enable auto-answer (requires a valid allowlist)
+//   WHATSAPP_AUTO_ACCEPT_CALLERS=62812...,62858... → exact E.164 caller allowlist
+//   WHATSAPP_BOT_AUDIO_INJECT=0    → accept without WebAudio mic inject / greeting play
+//   WHATSAPP_BOT_HANGUP_AFTER_AUDIO=0 → leave call open after accept (no auto hangup)
+//   WHATSAPP_DEBUG=1               → show Chrome window for debugging only
+//
+// Chrome is ALWAYS headless unless WHATSAPP_DEBUG=1 is set.
+//
+// Audio file:
+//   WHATSAPP_BOT_AUDIO=/abs/path.wav|m4a
+// WAV is decoded into WebAudio; compressed M4A is streamed from a tokenized
+// loopback-only endpoint into an HTMLAudioElement and the patched mic graph.
 const defaultBotAudio = path.join(sourceRoot, 'assets/audio/bot-greeting-id.wav');
 const botAudioPath = process.env.WHATSAPP_BOT_AUDIO
   ? path.resolve(process.env.WHATSAPP_BOT_AUDIO)
   : defaultBotAudio;
-const autoAcceptCalls = process.env.WHATSAPP_AUTO_ACCEPT_CALLS !== '0';
+const autoAcceptCalls = process.env.WHATSAPP_AUTO_ACCEPT_CALLS === '1';
+const autoAcceptCallerConfig = parseAutoAcceptCallers(process.env.WHATSAPP_AUTO_ACCEPT_CALLERS || '');
+const allowedCallerPhones = new Set(autoAcceptCallerConfig.callers);
+const botAudioInject = process.env.WHATSAPP_BOT_AUDIO_INJECT !== '0';
+const botHangupAfterAudio = process.env.WHATSAPP_BOT_HANGUP_AFTER_AUDIO !== '0';
+const botAudioMode = selectCallAudioMode(botAudioPath);
 // STRICT RULE: Always headless in production. Chrome window only for debugging.
 // Set WHATSAPP_DEBUG=1 to show Chrome window during testing/debugging.
 const voiceBotHeadless = process.env.WHATSAPP_DEBUG !== '1';
+// After greeting finishes, wait this long then hang up (default 1500ms).
 const botHangupPaddingMs = Number(process.env.WHATSAPP_BOT_HANGUP_PADDING_MS || 1500);
 let lastCall = null;
 let activeBotCall = null;
 let botCallInFlight = false;
+let botAudioReady = false;
+let activeBotAudioGrant = null;
+let automaticCallReservation = null;
+let callerMappingGeneration = 0;
+let callerMappingSummary = {
+  status: allowedCallerPhones.size > 0 ? 'pending' : 'empty',
+  mappedCount: 0,
+  unresolvedCount: allowedCallerPhones.size,
+  refreshedAt: null,
+  error: null,
+};
+const callerIdentityCache = new Map();
+const callAutomationStates = new Map();
 let cachedChatLockSecret = undefined;
 
 function logJson(level, event, detail) {
@@ -166,6 +231,7 @@ const client = new Client({
   authStrategy: new LocalAuth({ clientId: 'primary', dataPath: paths.auth }),
   authTimeoutMs: 120000,
   qrMaxRetries: 0,
+  bypassCSP: true,
   puppeteer: {
     // Headed mode when auto-accept is enabled: WhatsApp's call accept UI/WebRTC
     // is more reliable with a real window than pure headless.
@@ -178,11 +244,8 @@ const client = new Client({
       '--disable-features=Translate,MediaRouter',
       '--no-first-run',
       '--no-default-browser-check',
-      // Experimental voice-bot: inject WAV as the page microphone so WA can send it.
-      // File can be swapped later via WHATSAPP_BOT_AUDIO without code changes.
-      '--use-fake-device-for-media-stream',
-      '--use-fake-ui-for-media-stream',
-      `--use-file-for-fake-audio-capture=${botAudioPath}`,
+      // Call audio is scoped through the bridge's guarded WebAudio destination.
+      // Never install a process-wide fake capture device: unrelated calls must be untouched.
       '--autoplay-policy=no-user-gesture-required',
       '--window-size=1280,900',
     ],
@@ -766,6 +829,217 @@ async function searchMessagesDirect(query, chatId, limit) {
   }, query, chatId, limit);
 }
 
+function withTimeout(promise, timeoutMs, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+function cacheCallerIdentity({ pn, lid = null }, generation = callerMappingGeneration) {
+  if (generation !== callerMappingGeneration) return null;
+  const pnJid = serializePeerJid(pn).toLowerCase();
+  const lidJid = serializePeerJid(lid).toLowerCase() || null;
+  const phone = phoneFromPnJid(pnJid);
+  if (!phone) return null;
+  const identity = { phone, pnJid: `${phone}@c.us`, lidJid };
+  callerIdentityCache.set(identity.pnJid, identity);
+  callerIdentityCache.set(`${phone}@s.whatsapp.net`, identity);
+  if (lidJid && isLidJid(lidJid)) callerIdentityCache.set(lidJid, identity);
+  return identity;
+}
+
+async function queryCallerIdentity(peerJid, generation = callerMappingGeneration) {
+  const jid = serializePeerJid(peerJid).toLowerCase();
+  if (!jid) return null;
+  const cached = callerIdentityCache.get(jid);
+  if (cached && (isLidJid(jid) || isLidJid(cached.lidJid))) return cached;
+
+  const directPhone = phoneFromPnJid(jid);
+  if (directPhone) {
+    cacheCallerIdentity({ pn: `${directPhone}@c.us` }, generation);
+  }
+
+  const rows = await withTimeout(
+    client.getContactLidAndPhone([jid]),
+    7000,
+    'caller PN/LID lookup',
+  );
+  const row = Array.isArray(rows) ? rows[0] : null;
+  const identity = row ? cacheCallerIdentity(row, generation) : null;
+  if (identity && (jid === identity.pnJid || jid === identity.lidJid || jid === `${identity.phone}@s.whatsapp.net`)) {
+    return identity;
+  }
+  return directPhone ? callerIdentityCache.get(`${directPhone}@c.us`) || null : null;
+}
+
+async function resolveCallPeerIdentity(peerJid) {
+  const jid = serializePeerJid(peerJid).toLowerCase();
+  if (!jid) return { peerJid: '', resolved: false, reason: 'missing-peer-jid' };
+  const cached = callerIdentityCache.get(jid);
+  if (cached) return { peerJid: jid, resolved: true, source: 'cache', ...cached };
+
+  const directPhone = phoneFromPnJid(jid);
+  if (directPhone) {
+    const identity = cacheCallerIdentity({ pn: `${directPhone}@c.us` });
+    return { peerJid: jid, resolved: true, source: 'direct-pn', ...identity };
+  }
+  if (!isLidJid(jid)) return { peerJid: jid, resolved: false, reason: 'unsupported-peer-jid' };
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const identity = await queryCallerIdentity(jid);
+      if (identity) return { peerJid: jid, resolved: true, source: attempt === 1 ? 'lookup' : 'lookup-retry', ...identity };
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt === 1) await sleep(200);
+  }
+  return lastError
+    ? { peerJid: jid, resolved: false, reason: 'lid-lookup-failed', error: lastError.message }
+    : { peerJid: jid, resolved: false, reason: 'lid-mapping-missing' };
+}
+
+async function refreshAllowedCallerMappings() {
+  const generation = ++callerMappingGeneration;
+  callerMappingSummary = {
+    status: allowedCallerPhones.size > 0 ? 'refreshing' : 'empty',
+    mappedCount: 0,
+    unresolvedCount: allowedCallerPhones.size,
+    refreshedAt: null,
+    error: null,
+  };
+  if (allowedCallerPhones.size === 0) return callerMappingSummary;
+
+  const settled = await Promise.allSettled(
+    [...allowedCallerPhones].map((phone) => queryCallerIdentity(`${phone}@c.us`, generation)),
+  );
+  if (generation !== callerMappingGeneration) return callerMappingSummary;
+  const mappedCount = settled.filter((result) => result.status === 'fulfilled' && isLidJid(result.value?.lidJid)).length;
+  const pnOnlyCount = settled.filter((result) => result.status === 'fulfilled' && result.value && !isLidJid(result.value.lidJid)).length;
+  const errors = settled
+    .filter((result) => result.status === 'rejected')
+    .map((result) => result.reason?.message || String(result.reason));
+  callerMappingSummary = {
+    status: mappedCount === allowedCallerPhones.size ? 'ready' : 'partial',
+    mappedCount,
+    pnOnlyCount,
+    unresolvedCount: allowedCallerPhones.size - mappedCount,
+    refreshedAt: new Date().toISOString(),
+    error: errors.length > 0 ? truncateText(errors.join(' | '), 300) : null,
+  };
+  logJson('info', 'call-allowlist-mapping', callerMappingSummary);
+  return callerMappingSummary;
+}
+
+function callOwnershipKey(callId, peerJid) {
+  const id = typeof callId === 'string' ? callId : '';
+  const peer = serializePeerJid(peerJid);
+  return id && peer ? `${id}\n${peer}` : '';
+}
+
+function getCallAutomationState(callId, peerJid) {
+  return callAutomationStates.get(callOwnershipKey(callId, peerJid)) || null;
+}
+
+function rememberCallAutomationState(callId, state, reason = null, peerJid = null) {
+  if (!callId) return false;
+  const peer = serializePeerJid(peerJid);
+  const key = callOwnershipKey(callId, peer);
+  if (!key) return false;
+  const current = callAutomationStates.get(key);
+  if (current?.state === 'terminal' && state !== 'terminal') return false;
+  callAutomationStates.set(key, { callId, state, reason, peerJid: peer, updatedAt: Date.now() });
+  const entries = [...callAutomationStates.entries()];
+  for (const [id, record] of entries) {
+    if (callAutomationStates.size <= 100 && Date.now() - record.updatedAt < 24 * 60 * 60 * 1000) break;
+    callAutomationStates.delete(id);
+  }
+  return true;
+}
+
+function getBotAudioLifecycle(callId, peerJid, { automatic = activeBotCall?.automatic === true } = {}) {
+  const peer = serializePeerJid(peerJid);
+  return evaluateBotAudioLifecycle({
+    callId,
+    peerJid: peer,
+    activeCallId: activeBotCall?.id,
+    activeCallPeerJid: activeBotCall?.from,
+    activeCallStatus: activeBotCall?.status,
+    automationState: getCallAutomationState(callId, peer)?.state || null,
+    automatic,
+    automaticReservationId: automaticCallReservation?.id,
+    automaticReservationPeerJid: automaticCallReservation?.peerJid,
+  });
+}
+
+function isCallTerminal(callId, peerJid = activeBotCall?.id === callId ? activeBotCall.from : null) {
+  const lifecycle = getBotAudioLifecycle(callId, peerJid);
+  return ['terminal-automation-state', 'terminal-call-status'].includes(lifecycle.reason);
+}
+
+function issueBotAudioGrant(callId, peerJid, { automatic = activeBotCall?.automatic === true } = {}) {
+  const peer = serializePeerJid(peerJid);
+  const lifecycle = getBotAudioLifecycle(callId, peer, { automatic });
+  if (!lifecycle.allowed) throw new Error(lifecycle.reason);
+  revokeBotAudioGrant();
+  const token = randomBytes(24).toString('hex');
+  activeBotAudioGrant = { callId, peerJid: peer, token, automatic, streams: new Set(), issuedAt: Date.now() };
+  return `http://127.0.0.1:${httpPort}/api/internal/call-audio/${token}`;
+}
+
+function revokeBotAudioGrant(callId = null, peerJid = null, expectedGrant = null) {
+  if (!activeBotAudioGrant) return false;
+  if (expectedGrant && activeBotAudioGrant !== expectedGrant) return false;
+  if (callId && activeBotAudioGrant.callId !== callId) return false;
+  if (peerJid && activeBotAudioGrant.peerJid !== serializePeerJid(peerJid)) return false;
+  const grant = activeBotAudioGrant;
+  activeBotAudioGrant = null;
+  for (const stream of grant.streams || []) stream.destroy();
+  return true;
+}
+
+function isOtherAutomaticCallActive(callId, peerJid) {
+  const peer = serializePeerJid(peerJid);
+  if (automaticCallReservation?.id
+    && (automaticCallReservation.id !== callId || automaticCallReservation.peerJid !== peer)) return true;
+  if (!activeBotCall?.id || (activeBotCall.id === callId && activeBotCall.from === peer)) return false;
+  return !['completed', 'hung-up', 'accept-failed', 'audio-failed-hung-up', 'call-ended'].includes(activeBotCall.status);
+}
+
+function handleCallEnded({ id, peerJid = null } = {}) {
+  const callId = typeof id === 'string' ? id : '';
+  if (!callId) return;
+  revokeBotAudioGrant(callId, peerJid);
+  rememberCallAutomationState(callId, 'terminal', 'call-ended', peerJid);
+  if (automaticCallReservation?.id === callId
+    && (!peerJid || automaticCallReservation.peerJid === serializePeerJid(peerJid))) {
+    automaticCallReservation = null;
+  }
+  if (activeBotCall?.id === callId
+    && (!peerJid || activeBotCall.from === serializePeerJid(peerJid))) {
+    activeBotCall = {
+      ...activeBotCall,
+      status: 'call-ended',
+      endedAt: new Date().toISOString(),
+      endedPeerJid: serializePeerJid(peerJid) || null,
+    };
+  }
+  logJson('info', 'call-ended', { id: callId, peerJid: serializePeerJid(peerJid) || null });
+}
+
+async function installCallEndedBinding() {
+  try {
+    await client.pupPage.exposeFunction('onWhatsealCallEnded', (detail) => handleCallEnded(detail || {}));
+  } catch (error) {
+    if (!/already exists|already registered|Cannot redefine/i.test(error.message)) throw error;
+  }
+}
+
 async function finalizeReady(source) {
   if (phase === 'ready') return;
   if (readyFinalizationInFlight) return await readyFinalizationInFlight;
@@ -791,6 +1065,33 @@ async function finalizeReady(source) {
     await publishState();
     await writeCompatibilitySnapshot();
     log.info('ready', `source=${source} chatCount=${chats.length}`);
+// Install experimental call bridge on every ready path (library-event AND
+    // operational-probe). Without this, operational-probe ready skips the
+    // client.on('ready') handler and only installs on first accept attempt.
+    try {
+      await installCallEndedBinding();
+      const bridge = await installCallBridge(client.pupPage);
+      const listener = await patchIncomingCallListener(client.pupPage);
+      const probe = await probeCallBridge(client.pupPage);
+      logJson('info', 'call-bridge-ready', {
+        source,
+        bridge,
+        listener,
+        probeSummary: {
+          installed: probe?.installed,
+          version: probe?.version,
+          gating: probe?.gating || null,
+          modules: probe?.modules
+            ? Object.fromEntries(
+              Object.entries(probe.modules).map(([k, v]) => [k, { ok: v.ok, error: v.error || null }]),
+            )
+            : null,
+        },
+      });
+      await refreshAllowedCallerMappings();
+    } catch (bridgeError) {
+      logJson('error', 'call-bridge-install-failed', { source, error: bridgeError.message });
+    }
 
     if (!healthTimer) {
       healthTimer = setInterval(async () => {
@@ -1045,34 +1346,97 @@ async function dispatch(method, params = {}) {
       ? {
           id: lastCall.id,
           from: lastCall.from,
+          fromMe: lastCall.fromMe,
           isVideo: lastCall.isVideo,
           isGroup: lastCall.isGroup,
           canHandleLocally: lastCall.canHandleLocally,
           webClientShouldHandle: lastCall.webClientShouldHandle,
           timestamp: lastCall.timestamp,
+          callerIdentity: lastCall.callerIdentity || null,
+          automationPolicy: lastCall.automationPolicy || null,
         }
       : null;
     return {
       lastCall: safeLastCall,
       activeBotCall: activeBotCall || null,
       autoAcceptCalls,
+      autoAcceptEffective: autoAcceptCalls
+        && autoAcceptCallerConfig.valid
+        && allowedCallerPhones.size > 0
+        && (!botAudioInject || botAudioReady),
+      allowlist: {
+        valid: autoAcceptCallerConfig.valid,
+        count: allowedCallerPhones.size,
+        invalidEntryCount: autoAcceptCallerConfig.invalidEntries.length,
+        mapping: callerMappingSummary,
+      },
       botAudioPath,
+      botAudioMode,
+      botAudioReady,
       message: safeLastCall ? undefined : 'No incoming calls detected since daemon started.',
     };
   }
 
+
+  if (method === 'deepProbeVoipStack') {
+    try {
+      await installCallBridge(client.pupPage);
+      return await deepProbeVoipStack(client.pupPage);
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
   if (method === 'getCallBotConfig') {
     return {
       autoAcceptCalls,
+      autoAcceptEffective: autoAcceptCalls
+        && autoAcceptCallerConfig.valid
+        && allowedCallerPhones.size > 0
+        && (!botAudioInject || botAudioReady),
+      allowlist: {
+        configured: allowedCallerPhones.size > 0,
+        valid: autoAcceptCallerConfig.valid,
+        count: allowedCallerPhones.size,
+        invalidEntryCount: autoAcceptCallerConfig.invalidEntries.length,
+        mapping: callerMappingSummary,
+      },
+      botAudioInject,
+      botHangupAfterAudio,
       botAudioPath,
+      botAudioMode,
+      botAudioReady,
       botHangupPaddingMs,
       headless: voiceBotHeadless,
-      debugMode: process.env.WHATSAPP_DEBUG === '1',
-      canChangeAudio: 'Set WHATSAPP_BOT_AUDIO to another WAV path and restart the daemon.',
+      toggles: {
+        autoAccept: 'WHATSAPP_AUTO_ACCEPT_CALLS=1 enables auto-answer. Default off.',
+        autoAcceptCallers: 'WHATSAPP_AUTO_ACCEPT_CALLERS is a comma-separated exact E.164 allowlist. Empty/invalid fails closed.',
+        audioInject: 'WHATSAPP_BOT_AUDIO_INJECT=0 to accept without greeting inject. Default on.',
+        hangupAfterAudio: 'WHATSAPP_BOT_HANGUP_AFTER_AUDIO=0 to keep call open after accept/play. Default on.',
+        audioFile: 'WHATSAPP_BOT_AUDIO=/abs/path.wav|m4a. Restart daemon after change.',
+        hangupPaddingMs: 'WHATSAPP_BOT_HANGUP_PADDING_MS=1500 (ms after audio before hangup).',
+        debug: 'WHATSAPP_DEBUG=1 shows Chrome window for testing only. Default always headless.',
+      },
+      canChangeAudio: 'WAV uses decodeAudioData; M4A uses a tokenized loopback Range stream into HTMLAudioElement/WebAudio. MP3 is not enabled.',
       disableAutoAccept: 'Set WHATSAPP_AUTO_ACCEPT_CALLS=0 and restart the daemon.',
+      disableAudioInject: 'Set WHATSAPP_BOT_AUDIO_INJECT=0 and restart the daemon.',
       showChromeWindow: 'Set WHATSAPP_DEBUG=1 to show Chrome window for testing/debugging.',
-      note: 'Chrome is ALWAYS headless by default. Debug mode (WHATSAPP_DEBUG=1) shows the window for testing only.',
+      note: 'Chrome is ALWAYS headless by default. Call accept is fail-closed: exact E.164 allowlist + personal voice only + VoIP-first stack.acceptCall + WebAudio mic inject (bridge v9). No raw WAWap accept stanza.',
+      research: {
+        wwebjs_201825: 'https://github.com/wwebjs/whatsapp-web.js/pull/201825',
+        wwebjs_201881: 'https://github.com/wwebjs/whatsapp-web.js/pull/201881',
+        wppconnect_2521: 'https://github.com/wppconnect-team/wppconnect-server/pull/2521',
+      },
     };
+  }
+
+  if (method === 'probeCallBridge') {
+    try {
+      await installCallBridge(client.pupPage);
+      await patchIncomingCallListener(client.pupPage);
+      return await probeCallBridge(client.pupPage);
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
   }
 
   if (method === 'rejectCall') {
@@ -1087,7 +1451,9 @@ async function dispatch(method, params = {}) {
 
   if (method === 'exploreCallApi') {
     try {
-      return await inspectCallApi();
+      const legacy = await inspectCallApi();
+      const bridge = await probeCallBridge(client.pupPage);
+      return { legacy, bridge };
     } catch (err) {
       return { error: err.message };
     }
@@ -1441,10 +1807,12 @@ client.on('authenticated', async () => {
 
 client.on('ready', async () => {
   try {
-    // Enable desktop notifications early so incoming-call UI is more likely to render.
+    // Grant notification permission without clicking broad WhatsApp UI controls.
     const permission = await ensureDesktopNotificationPermission();
-    const notif = await enableDesktopNotifications();
-    logJson('info', 'ready-enable-notifications', { permission, notif });
+    logJson('info', 'ready-enable-notifications', { permission });
+
+    // Call bridge install lives in finalizeReady so operational-probe ready
+    // (the common path) also gets the VoIP helpers + activeCall listener.
     await finalizeReady('library-event');
   } catch (error) {
     log.error('ready-finalization-failed', truncateText(error?.message || String(error), 300));
@@ -1488,7 +1856,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function getWavDurationMs(filePath) {
+async function getAudioDurationMs(filePath) {
   try {
     const { stdout } = await execFileAsync('afinfo', [filePath], { timeout: 5000 });
     const match = String(stdout).match(/estimated duration:\s*([0-9.]+)\s*sec/i);
@@ -1497,6 +1865,95 @@ async function getWavDurationMs(filePath) {
   } catch {
     return 10000;
   }
+}
+
+async function getBotAudioMetadata() {
+  const metadata = await lstat(botAudioPath);
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error('Bot audio must be a regular file, not a directory or symbolic link.');
+  }
+  if (metadata.size <= 0) throw new Error('Bot audio file is empty.');
+  if (botAudioMode === 'unsupported') {
+    throw new Error('Bot audio must use a supported .wav, .m4a, or .mp4 extension.');
+  }
+  return {
+    size: metadata.size,
+    mtimeMs: metadata.mtimeMs,
+    mode: botAudioMode,
+    contentType: botAudioMode === 'media-element-stream' ? 'audio/mp4' : 'audio/wav',
+  };
+}
+
+async function serveBotAudio(req, res) {
+  if (!botAudioReady || botAudioMode !== 'media-element-stream') {
+    return res.status(404).end();
+  }
+  const grant = activeBotAudioGrant;
+  const requestedToken = String(req.params?.token || '');
+  const grantedToken = String(grant?.token || '');
+  const tokenMatches = requestedToken.length === grantedToken.length
+    && requestedToken.length > 0
+    && timingSafeEqual(Buffer.from(requestedToken), Buffer.from(grantedToken));
+  const lifecycle = getBotAudioLifecycle(grant?.callId, grant?.peerJid, { automatic: grant?.automatic === true });
+  if (!tokenMatches || activeBotAudioGrant !== grant || !lifecycle.allowed) {
+    return res.status(404).end();
+  }
+  const origin = String(req.headers.origin || '');
+  if (origin !== 'https://web.whatsapp.com') return res.status(403).end();
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Expose-Headers', 'Accept-Ranges, Content-Length, Content-Range');
+  let metadata;
+  try {
+    metadata = await getBotAudioMetadata();
+  } catch {
+    botAudioReady = false;
+    return res.status(404).end();
+  }
+  const currentLifecycle = getBotAudioLifecycle(grant.callId, grant.peerJid, { automatic: grant.automatic === true });
+  if (activeBotAudioGrant !== grant || !currentLifecycle.allowed) return res.status(404).end();
+  const range = parseSingleByteRange(req.headers.range, metadata.size);
+  if (range?.invalid) {
+    res.setHeader('Content-Range', `bytes */${metadata.size}`);
+    return res.status(416).end();
+  }
+
+  const start = range?.start ?? 0;
+  const end = range?.end ?? metadata.size - 1;
+  res.status(range ? 206 : 200);
+  res.setHeader('Content-Type', metadata.contentType);
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('Content-Length', end - start + 1);
+  if (range) res.setHeader('Content-Range', `bytes ${start}-${end}/${metadata.size}`);
+  if (req.method === 'HEAD') return res.end();
+
+  const stream = createReadStream(botAudioPath, { start, end });
+  grant.streams.add(stream);
+  stream.once('close', () => grant.streams.delete(stream));
+  stream.once('error', (error) => {
+    logJson('error', 'call-bot-audio-stream-failed', { error: error.message });
+    if (!res.headersSent) res.status(500).end();
+    else res.destroy(error);
+  });
+  res.once('close', () => {
+    if (!res.writableEnded) stream.destroy();
+  });
+  stream.pipe(res);
+}
+
+function requestHasActiveBotAudioGrant(req) {
+  const grant = activeBotAudioGrant;
+  if (!grant) return false;
+  const requestedToken = String(req.params?.token || '');
+  const grantedToken = String(grant.token || '');
+  const tokenMatches = requestedToken.length === grantedToken.length
+    && requestedToken.length > 0
+    && timingSafeEqual(Buffer.from(requestedToken), Buffer.from(grantedToken));
+  if (!tokenMatches || activeBotAudioGrant !== grant) return false;
+  return getBotAudioLifecycle(grant.callId, grant.peerJid, {
+    automatic: grant.automatic === true,
+  }).allowed;
 }
 
 async function inspectCallApi() {
@@ -1582,8 +2039,8 @@ async function ensureDesktopNotificationPermission() {
     const origin = 'https://web.whatsapp.com';
     const context = page.browserContext?.() || page.browser()?.defaultBrowserContext?.();
     if (context?.overridePermissions) {
-      await context.overridePermissions(origin, ['notifications', 'microphone', 'camera']);
-      result.override = 'granted-notifications-microphone-camera';
+      await context.overridePermissions(origin, ['notifications']);
+      result.override = 'granted-notifications';
     }
     result.permission = await page.evaluate(async () => {
       try {
@@ -1920,89 +2377,6 @@ async function unlockChatLockPrompt({ code = null, force = false } = {}) {
   };
 }
 
-async function enableDesktopNotifications() {
-  // CORRECT behavior: click "Turn on" so WhatsApp enables desktop notifications.
-  // Do NOT click Close / Not now — that keeps notifications off and can hide call UI.
-  return await client.pupPage.evaluate(() => {
-    const result = {
-      clicked: [],
-      candidates: [],
-      permission: (typeof Notification !== 'undefined' ? Notification.permission : 'unsupported'),
-    };
-
-    const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-    const textOf = (el) => normalize(el.innerText || el.textContent || '');
-    const labelOf = (el) => normalize([
-      el.getAttribute('aria-label') || '',
-      el.getAttribute('title') || '',
-      el.getAttribute('data-testid') || '',
-      el.innerText || '',
-      el.textContent || '',
-    ].join(' '));
-
-    // Prefer the butterbar "Turn on" control when present.
-    const targets = [];
-    const butterbar = document.querySelector('[data-testid="chat-butterbar"]');
-    if (butterbar) {
-      const btn = butterbar.querySelector('button, [role="button"]') || butterbar;
-      targets.push(btn);
-    }
-    for (const el of document.querySelectorAll('button, [role="button"], div[role="button"]')) {
-      targets.push(el);
-    }
-
-    const seen = new Set();
-    for (const el of targets) {
-      if (!el || seen.has(el)) continue;
-      seen.add(el);
-      const rect = el.getBoundingClientRect?.() || { width: 0, height: 0 };
-      if (!(rect.width > 0 && rect.height > 0)) continue;
-
-      const text = textOf(el);
-      const label = labelOf(el) || text;
-      if (!label) continue;
-
-      // Avoid matching "Turn on" buried inside long unrelated labels without the notification context.
-      const isExactTurnOn = /^turn on$/i.test(text) || /^turn on$/i.test(label);
-      const isNotificationTurnOn = (
-        /\bturn on\b/i.test(label)
-        && /notification/i.test(label)
-      );
-      const isTurnOn = (
-        isExactTurnOn
-        || isNotificationTurnOn
-        || /turn on desktop notifications/i.test(label)
-        || /enable (desktop )?notifications/i.test(label)
-        || /aktifkan notifikasi/i.test(label)
-        || /nyalakan notifikasi/i.test(label)
-      );
-      if (!isTurnOn) continue;
-
-      // Never click dismiss-style controls.
-      if (/\b(close|not now|dismiss|maybe later|nanti|tutup)\b/i.test(label) && !isExactTurnOn) continue;
-
-      result.candidates.push(label.slice(0, 100));
-      try {
-        el.scrollIntoView?.({ block: 'center', inline: 'center' });
-        el.focus?.();
-        el.click();
-        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-        result.clicked.push({
-          action: 'turn-on',
-          label: label.slice(0, 100),
-          text: text.slice(0, 80),
-          testId: el.getAttribute('data-testid') || null,
-        });
-      } catch (error) {
-        result.clicked.push({ action: 'turn-on', error: error.message, label: label.slice(0, 100) });
-      }
-    }
-    return result;
-  });
-}
-
 async function captureCallDebugScreenshot(tag = 'call') {
   try {
     const file = path.join(paths.state, `debug-${tag}-${Date.now()}.png`);
@@ -2063,13 +2437,16 @@ async function getCallConnectionState() {
   return await client.pupPage.evaluate(() => {
     try {
       const CC = window.require('WAWebCallCollection');
-      const active = CC?.lastActiveCall || null;
+      const active = CC?.activeCall || null;
+      const state = active
+        ? (typeof active.getState === 'function' ? active.getState() : (active.state ?? null))
+        : null;
       return {
         isInConnectedCall: Boolean(CC?.isInConnectedCall),
         pendingOfferCount: CC?.pendingOffers ? Object.keys(CC.pendingOffers).length : 0,
         lastActiveCallId: active?.id || null,
-        lastActiveCallState: active?.state || null,
-        peerJid: active?.peerJid || null,
+        lastActiveCallState: state,
+        peerJid: active?.peerJid?._serialized || active?.peerJid || null,
       };
     } catch (error) {
       return { error: error.message, isInConnectedCall: false };
@@ -2077,8 +2454,15 @@ async function getCallConnectionState() {
   });
 }
 
-async function clickMatchingButtons(matchers, { maxClicks = 2, exclude = [] } = {}) {
-  return await client.pupPage.evaluate((patterns, limit, excludePatterns) => {
+async function clickMatchingButtons(matchers, {
+  maxClicks = 2,
+  exclude = [],
+  expectedCallId = null,
+  expectedPeerJid = null,
+} = {}) {
+  return await client.pupPage.evaluate((patterns, limit, excludePatterns, callId, peerJid) => {
+    const target = window.__whatsealCallBridgeApi?.verifyCallTarget?.(callId, peerJid) || { matches: false, reason: 'call-target-guard-missing' };
+    if (!target.matches) return { clicked: [], scanned: [], candidateCount: 0, target };
     const regexes = patterns.map((p) => new RegExp(p, 'i'));
     const excludeRes = excludePatterns.map((p) => new RegExp(p, 'i'));
     const selectors = [
@@ -2115,11 +2499,11 @@ async function clickMatchingButtons(matchers, { maxClicks = 2, exclude = [] } = 
       if (clicked.length >= limit) continue;
       try {
         el.scrollIntoView?.({ block: 'center', inline: 'center' });
+        const currentTarget = window.__whatsealCallBridgeApi.verifyCallTarget(callId, peerJid);
+        if (!currentTarget.matches) {
+          return { clicked, scanned: scanned.slice(0, 20), candidateCount: candidates.length, target: currentTarget };
+        }
         el.click();
-        // Also dispatch pointer events for React handlers that ignore plain click.
-        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-        el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
         clicked.push({
           label: label.slice(0, 120),
           dataTestId: el.getAttribute('data-testid') || null,
@@ -2130,14 +2514,34 @@ async function clickMatchingButtons(matchers, { maxClicks = 2, exclude = [] } = 
       }
     }
     return { clicked, scanned: scanned.slice(0, 20), candidateCount: candidates.length };
-  }, matchers, maxClicks, exclude);
+  }, matchers, maxClicks, exclude, expectedCallId, expectedPeerJid);
 }
 
 async function rejectActiveCall(callInfo = lastCall) {
   if (!callInfo) return { success: false, error: 'No active call to reject.' };
+  if (!callInfo.id || !callInfo.from) {
+    return { success: false, error: 'Exact call ID and peer are required to reject.' };
+  }
+  // Prefer VoIP stack reject (PR #201825) over library WAWap reject stanza.
+  try {
+    const voip = await voipRejectCall(client.pupPage, { callId: callInfo.id, peerJid: callInfo.from });
+    if (voip?.success) {
+      revokeBotAudioGrant(callInfo.id, callInfo.from);
+      handleCallEnded({ id: callInfo.id, peerJid: callInfo.from });
+      log.info('call-rejected', { id: callInfo.id, from: callInfo.from, method: 'voip-stack', voip });
+      return { success: true, method: 'voip-stack', voip, rejectedCall: lastCall };
+    }
+  } catch (error) {
+    log.debug('call-reject-voip-failed', error.message);
+  }
   try {
     if (typeof callInfo.reject === 'function') {
+      const target = await verifyBotCallTarget(client.pupPage, { callId: callInfo.id, peerJid: callInfo.from });
+      if (!target.matches) return { success: false, error: target.reason, target };
       await callInfo.reject();
+      await teardownBotCallMedia(client.pupPage).catch(() => {});
+      revokeBotAudioGrant(callInfo.id, callInfo.from);
+      handleCallEnded({ id: callInfo.id, peerJid: callInfo.from });
       log.info('call-rejected', { id: callInfo.id, from: callInfo.from, method: 'library' });
       return { success: true, method: 'library', rejectedCall: lastCall };
     }
@@ -2145,169 +2549,208 @@ async function rejectActiveCall(callInfo = lastCall) {
     log.debug('call-reject-library-failed', error.message);
   }
 
-  const ui = await clickMatchingButtons(['decline', 'reject', 'tolak', 'end call', 'akhiri'], { maxClicks: 2 });
+  const ui = await clickMatchingButtons(['decline', 'reject', 'tolak', 'end call', 'akhiri'], {
+    maxClicks: 1,
+    expectedCallId: callInfo.id,
+    expectedPeerJid: callInfo.from,
+  });
+  if (ui.clicked.length > 0) {
+    await teardownBotCallMedia(client.pupPage).catch(() => {});
+    revokeBotAudioGrant(callInfo.id, callInfo.from);
+    handleCallEnded({ id: callInfo.id, peerJid: callInfo.from });
+  }
   log.info('call-rejected', { id: callInfo.id, from: callInfo.from, method: 'ui', ui });
   return { success: ui.clicked.length > 0, method: 'ui', ui, rejectedCall: lastCall };
 }
 
-async function hangupActiveCall() {
-  const ui = await clickMatchingButtons([
-    'end call',
-    'hang up',
-    'leave',
-    'akhiri panggilan',
-    'akhiri',
-    'end',
-  ], { maxClicks: 3 });
+async function hangupActiveCall(
+  callId = activeBotCall?.id || lastCall?.id || null,
+  peerJid = activeBotCall?.id === callId ? activeBotCall.from : (lastCall?.id === callId ? lastCall.from : null),
+) {
+  if (!callId || !peerJid) return { success: false, error: 'Exact call ID and peer are required to hang up.' };
+  // Prefer VoIP stack endCall first (PR #201825 / #201881). UI click is fallback only —
+  // broad matchers like "end" previously false-matched chat-list / wordmark nodes.
+  let internal = [];
+  try {
+    const voip = await voipEndCall(client.pupPage, { callId, peerJid });
+    internal.push(voip);
+  } catch (error) {
+    internal.push({ method: 'voipEndCall', success: false, error: error.message });
+  }
 
-  // Fallback: try internal call model end/leave methods if present.
-  const internal = await client.pupPage.evaluate(() => {
-    const attempts = [];
-    try {
-      const CC = window.require('WAWebCallCollection');
-      const active = CC?.lastActiveCall || null;
-      if (active) {
-        for (const name of ['end', 'hangup', 'leave', 'reject', 'cancel']) {
-          if (typeof active[name] === 'function') {
-            try {
-              active[name]();
-              attempts.push({ method: name, success: true });
-            } catch (error) {
-              attempts.push({ method: name, error: error.message });
-            }
-          }
-        }
-      }
-    } catch (error) {
-      attempts.push({ method: 'WAWebCallCollection', error: error.message });
-    }
-    return attempts;
-  });
+  let ui = { clicked: [], scanned: [], candidateCount: 0 };
+  const voipOk = internal.some((item) => item && item.success);
+  if (!voipOk) {
+    ui = await clickMatchingButtons([
+      '^end call$',
+      '^hang up$',
+      'akhiri panggilan',
+      'end-call',
+      'ic-call-end',
+      'ic-call-end-filled',
+      'wds-ic-call-end',
+    ], {
+      maxClicks: 1,
+      exclude: ['send', 'document', 'notification', 'chat', 'list', 'wordmark', 'status'],
+      expectedCallId: callId,
+      expectedPeerJid: peerJid,
+    });
+  }
 
-  const success = ui.clicked.length > 0 || internal.some((item) => item.success);
-  if (activeBotCall) {
+  const success = voipOk || ui.clicked.length > 0;
+  if (success) {
+    await teardownBotCallMedia(client.pupPage).catch(() => {});
+    revokeBotAudioGrant(callId, peerJid);
+    handleCallEnded({ id: callId, peerJid });
+  }
+  if (activeBotCall && !success && !isCallTerminal(callId, peerJid)) {
     activeBotCall = {
       ...activeBotCall,
-      status: success ? 'hung-up' : 'hangup-failed',
+      status: 'hangup-failed',
       hungUpAt: new Date().toISOString(),
       hangup: { ui, internal },
     };
   }
-  logJson('info', 'call-hangup', { success, ui, internal });
+  logJson('info', 'call-hangup', { success, ui, internal, reason: voipOk ? 'voip-first' : 'ui-fallback' });
   return { success, ui, internal };
 }
 
-async function tryInternalAccept(callInfo) {
-  // Only invoke real accept/answer methods on the call model.
-  // Do NOT send raw WAWap accept stanzas — signal-only accept kills the ring/popup
-  // without establishing media, which makes the incoming-call UI disappear.
-  return await client.pupPage.evaluate((callId) => {
-    const attempts = [];
-    try {
-      const Store = window.Store || {};
-      const callCollection = Store.Call || window.require?.('WAWebCallCollection');
-      const active = callCollection?.lastActiveCall
-        || callCollection?.get?.(callId)
-        || (callCollection?._models || []).find?.((c) => c?.id === callId)
-        || null;
-      if (active) {
-        const call = active;
-        for (const name of ['accept', 'answer', 'join', 'offerAccept']) {
-          if (typeof call[name] === 'function') {
-            try {
-              call[name]();
-              attempts.push({ method: `call.${name}()`, success: true });
-            } catch (error) {
-              attempts.push({ method: `call.${name}()`, error: error.message });
-            }
-          }
-        }
-        attempts.push({
-          method: 'call.methods',
-          available: Object.getOwnPropertyNames(Object.getPrototypeOf(call))
-            .filter((k) => typeof call[k] === 'function')
-            .slice(0, 40),
-        });
-      } else {
-        attempts.push({ method: 'Store.Call', error: 'no active call model' });
-      }
-    } catch (error) {
-      attempts.push({ method: 'Store.Call', error: error.message });
-    }
-    return attempts;
-  }, callInfo.id);
+async function tryInternalAccept(callInfo, { injectAudio = botAudioInject } = {}) {
+  // Port of wwebjs PR #201825 acceptCall via VoIP stack (see lib/call-bridge.mjs).
+  // Also tries alternate module names from PR #201881-style controller resolution.
+  // Never sends raw WAWap accept stanzas (dismiss ring / no media).
+  try {
+    const result = await voipAcceptCall(client.pupPage, {
+      callId: callInfo.id,
+      peerJid: callInfo.from,
+      isVideo: Boolean(callInfo.isVideo),
+      injectAudio: Boolean(injectAudio),
+    });
+    return Array.isArray(result) ? result : [result];
+  } catch (error) {
+    return [{ method: 'voipAcceptCall', success: false, error: error.message }];
+  }
 }
 
-async function waitForConnectedCall({ timeoutMs = 8000 } = {}) {
+async function waitForConnectedCall({ timeoutMs = 8000, expectedCallId = null, expectedPeerJid = null } = {}) {
   const started = Date.now();
+  const expectedId = typeof expectedCallId === 'string' ? expectedCallId : '';
+  const expectedPeer = serializePeerJid(expectedPeerJid);
   let last = null;
   while (Date.now() - started < timeoutMs) {
     last = await getCallConnectionState();
-    if (last?.isInConnectedCall) return { connected: true, state: last };
-    // State names vary; treat common connected labels as success.
-    if (typeof last?.lastActiveCallState === 'string'
-      && /connected|active|ongoing|in_call|accepted/i.test(last.lastActiveCallState)) {
-      return { connected: true, state: last };
+    const lastId = typeof last?.lastActiveCallId === 'string' ? last.lastActiveCallId : '';
+    const lastPeer = serializePeerJid(last?.peerJid);
+    if (expectedId && lastId && lastId !== expectedId) {
+      return { connected: false, targetMismatch: true, state: last };
     }
+    if (expectedPeer && lastPeer && lastPeer !== expectedPeer) {
+      return { connected: false, targetMismatch: true, state: last };
+    }
+    const exactLastTarget = (!expectedId || lastId === expectedId) && (!expectedPeer || lastPeer === expectedPeer);
+    if (last?.isInConnectedCall && exactLastTarget) return { connected: true, state: last };
+    if (exactLastTarget
+      && typeof last?.lastActiveCallState === 'number'
+      && last.lastActiveCallState >= 3) {
+      return { connected: true, state: last, evidence: 'exact-active-call-numeric-state' };
+    }
+    // Bridge connection helper may expose richer flags.
+    try {
+      const bridgeState = await client.pupPage.evaluate(() => window.__whatsealCallBridgeApi?.connectionState?.() || null);
+      const bridgeId = typeof bridgeState?.lastActiveCallId === 'string' ? bridgeState.lastActiveCallId : '';
+      const bridgePeer = serializePeerJid(bridgeState?.peerJid);
+      if ((expectedId && bridgeId && bridgeId !== expectedId) || (expectedPeer && bridgePeer && bridgePeer !== expectedPeer)) {
+        return { connected: false, targetMismatch: true, state: { ...last, bridgeState } };
+      }
+      const exactBridgeTarget = (!expectedId || bridgeId === expectedId) && (!expectedPeer || bridgePeer === expectedPeer);
+      if (bridgeState?.isInConnectedCall && exactBridgeTarget) {
+        return { connected: true, state: { ...last, bridgeState } };
+      }
+    } catch { /* ignore */ }
     await sleep(400);
   }
   return { connected: false, state: last };
 }
 
-async function acceptIncomingCall(callInfo, { hangupAfterAudio = true } = {}) {
+async function acceptIncomingCall(callInfo, {
+  hangupAfterAudio = botHangupAfterAudio,
+  injectAudio = botAudioInject,
+  automatic = false,
+} = {}) {
   if (!callInfo) return { success: false, error: 'No active call to accept.' };
+  if (!callInfo.id || !callInfo.from) return { success: false, error: 'Exact call ID and peer are required to accept.' };
+  if (callInfo.fromMe || callInfo.isGroup || callInfo.isVideo) {
+    return {
+      success: false,
+      error: callInfo.fromMe ? 'from-self' : (callInfo.isGroup ? 'group-call' : 'video-call'),
+    };
+  }
   if (botCallInFlight) return { success: false, error: 'Another bot call is already in progress.', activeBotCall };
-
+  if (activeBotCall?.id === callInfo.id
+    && activeBotCall.from === callInfo.from
+    && !['accept-failed', 'audio-failed', 'call-ended', 'completed', 'error'].includes(activeBotCall.status)) {
+    return { success: false, error: 'call-already-active', activeBotCall };
+  }
   botCallInFlight = true;
+
+  if (getCallAutomationState(callInfo.id, callInfo.from)?.state === 'terminal') {
+    botCallInFlight = false;
+    return { success: false, error: 'call-already-terminal', activeBotCall };
+  }
+  const initialTarget = await verifyBotCallTarget(client.pupPage, {
+    callId: callInfo.id,
+    peerJid: callInfo.from,
+  }).catch((error) => ({ matches: false, reason: error.message }));
+  if (!initialTarget.matches || getCallAutomationState(callInfo.id, callInfo.from)?.state === 'terminal') {
+    botCallInFlight = false;
+    return { success: false, error: initialTarget.matches ? 'call-already-terminal' : initialTarget.reason, target: initialTarget };
+  }
+
   const startedAt = new Date().toISOString();
+  const shouldInject = Boolean(injectAudio);
+  const shouldHangupAfter = Boolean(hangupAfterAudio) && shouldInject;
   activeBotCall = {
     id: callInfo.id,
     from: callInfo.from,
     isVideo: Boolean(callInfo.isVideo),
     isGroup: Boolean(callInfo.isGroup),
+    canHandleLocally: callInfo.canHandleLocally,
+    webClientShouldHandle: callInfo.webClientShouldHandle,
     status: 'accepting',
     botAudioPath,
+    injectAudio: shouldInject,
+    hangupAfterAudio: shouldHangupAfter,
     startedAt,
     headless: voiceBotHeadless,
+    automatic: Boolean(automatic),
   };
 
   try {
-    // Goal: preserve the incoming-call popup, then click Accept only.
-    // Do NOT body-click, do NOT send signal-only accept stanzas, do NOT open settings drawers.
+    // STRICT USER RULES:
+    // - Do not dismiss / hide the incoming-call UI
+    // - Do not body-click, open settings, type secrets, or send signal-only stanzas
+    // - Prefer: click Accept only. Fallback: VoIP stack acceptCall (PR #201825 / #201881 port)
     await focusWhatsAppWindow({ clickBody: false });
-
-    // Unlock only if a real Chat Lock / secret-code field is already visible.
-    // Never force-unlock or touch search during an active ring.
-    let chatLock = null;
     try {
-      chatLock = await unlockChatLockPrompt({ force: false });
-      logJson('info', 'call-chat-lock-unlock', {
-        success: chatLock?.success || false,
-        configured: chatLock?.configured || false,
-        filled: chatLock?.filled || false,
-        stillLocked: chatLock?.stillLocked ?? null,
-        skipped: chatLock?.skipped || false,
-        reason: chatLock?.reason || null,
-      });
-    } catch (error) {
-      chatLock = { success: false, error: error.message };
-      logJson('error', 'call-chat-lock-unlock-failed', { error: error.message });
+      await installCallBridge(client.pupPage);
+      await patchIncomingCallListener(client.pupPage);
+    } catch (bridgeError) {
+      logJson('error', 'call-bridge-ensure-failed', { error: bridgeError.message });
     }
+    await sleep(600);
 
-    // Give WhatsApp time to paint the ring UI before any scanning/clicking.
-    await sleep(800);
     const beforeUi = await dumpCallUiSnapshot();
     const beforeShot = await captureCallDebugScreenshot('before-accept');
     logJson('info', 'call-ui-before-accept', {
+      callId: callInfo.id,
+      canHandleLocally: callInfo.canHandleLocally,
+      webClientShouldHandle: callInfo.webClientShouldHandle,
       callState: beforeUi.callState,
       interestingButtons: (beforeUi.buttons || []).filter((b) => /accept|decline|answer|reject|call|phone|tolak|terima/i.test(`${b.ariaLabel} ${b.text} ${b.dataTestId} ${b.dataIcon}`)),
       buttonCount: (beforeUi.buttons || []).length,
       screenshot: beforeShot,
-      bodyTextSnippet: beforeUi.bodyTextSnippet,
-      chatLock,
     });
 
-    // Strict Accept matchers only — never Decline/Close/Turn on.
     const acceptMatchers = [
       '^accept$',
       '^answer$',
@@ -2339,63 +2782,107 @@ async function acceptIncomingCall(callInfo, { hangupAfterAudio = true } = {}) {
       'turn on',
       'notification',
       'mute',
+      'missed',
+      'callback',
     ];
 
     let acceptUi = { clicked: [], scanned: [], candidateCount: 0 };
+    let acceptUiActionUsed = false;
     let connected = { connected: false, state: null };
     let internal = [];
-    const notif = { skipped: true, reason: 'not-touched-during-incoming-call' };
 
-    // Poll for Accept button and click it when visible. No body-click. No WAWap stanza.
-    for (let attempt = 1; attempt <= 20; attempt += 1) {
-      // Soft focus only (no body click) so the toast/popup stays up.
-      if (attempt === 1 || attempt % 5 === 0) {
-        await focusWhatsAppWindow({ clickBody: false });
+    // Prefer VoIP accept immediately. Meta often disables web calling AB prop so
+    // the Accept UI never mounts; waiting 12s first makes the offer go stale.
+    // Never raw WAWap accept stanzas.
+    internal = await tryInternalAccept(callInfo, { injectAudio: shouldInject });
+    logJson('info', 'call-accept-voip-stack', {
+      internal,
+      reason: 'voip-first',
+      injectAudio: shouldInject,
+    });
+    const voipOk = internal.some((item) => item && item.success);
+    connected = await waitForConnectedCall({
+      timeoutMs: voipOk ? 15000 : 4000,
+      expectedCallId: callInfo.id,
+      expectedPeerJid: callInfo.from,
+    });
+
+    // If VoIP did not connect, briefly poll for Accept UI (popup-safe, Accept-only).
+    if (!connected.connected && shouldInject) {
+      for (let attempt = 1; attempt <= 8; attempt += 1) {
+      if (acceptUiActionUsed) break;
+        if (shouldInject) {
+          const prepared = await prepareBotCallMedia(client.pupPage, {
+            callId: callInfo.id,
+            peerJid: callInfo.from,
+          });
+          if (!prepared.success) {
+            connected = { connected: false, targetMismatch: true, state: prepared.target || prepared };
+            break;
+          }
+        }
+        acceptUi = await clickMatchingButtons(acceptMatchers, {
+          maxClicks: 1,
+          exclude: excludeMatchers,
+          expectedCallId: callInfo.id,
+          expectedPeerJid: callInfo.from,
+        });
+        if (acceptUi.target && !acceptUi.target.matches) {
+          await teardownBotCallMedia(client.pupPage).catch(() => {});
+          connected = { connected: false, targetMismatch: true, state: acceptUi.target };
+          break;
+        }
+        logJson('info', 'call-accept-click-attempt', {
+          attempt,
+          clicked: acceptUi.clicked,
+          scanned: acceptUi.scanned,
+          candidateCount: acceptUi.candidateCount,
+        });
+        if (acceptUi.clicked.length > 0) {
+          acceptUiActionUsed = true;
+          connected = await waitForConnectedCall({
+            timeoutMs: 8000,
+            expectedCallId: callInfo.id,
+            expectedPeerJid: callInfo.from,
+          });
+          break;
+        }
+        // One more VoIP attempt mid-ring if UI still missing.
+        if (attempt === 3 && !voipOk) {
+          internal = await tryInternalAccept(callInfo, { injectAudio: shouldInject });
+          logJson('info', 'call-accept-voip-stack', {
+            internal,
+            reason: 'voip-retry-mid-ui',
+            injectAudio: shouldInject,
+          });
+          connected = await waitForConnectedCall({
+            timeoutMs: 10000,
+            expectedCallId: callInfo.id,
+            expectedPeerJid: callInfo.from,
+          });
+          if (connected.connected) break;
+        }
+        await sleep(500);
       }
-
-      acceptUi = await clickMatchingButtons(acceptMatchers, {
-        maxClicks: 1,
-        exclude: excludeMatchers,
-      });
-      logJson('info', 'call-accept-click-attempt', { attempt, acceptUi });
-
-      if (acceptUi.clicked.length > 0) {
-        // Only after a real Accept UI click, wait for connected media.
-        connected = await waitForConnectedCall({ timeoutMs: 5000 });
-        if (connected.connected) break;
-
-        // If UI was clicked but model still not connected, try real model methods once.
-        // Still no raw WAWap signal-only stanza.
-        internal = await tryInternalAccept(callInfo);
-        logJson('info', 'call-accept-internal-after-ui', { attempt, internal });
-        connected = await waitForConnectedCall({ timeoutMs: 3000 });
-        if (connected.connected) break;
-      }
-
-      // Keep waiting for Accept UI — do not dismiss popup while ringing.
-      await sleep(700);
-    }
-
-    // Last resort: real model accept methods only, and only if UI never appeared.
-    if (!connected.connected && acceptUi.clicked.length === 0) {
-      internal = await tryInternalAccept(callInfo);
-      logJson('info', 'call-accept-internal-last-resort', { internal });
-      connected = await waitForConnectedCall({ timeoutMs: 2500 });
     }
 
     const afterUi = await dumpCallUiSnapshot();
     const afterShot = await captureCallDebugScreenshot(connected.connected ? 'accepted' : 'accept-failed');
-    const accepted = Boolean(connected.connected);
-    activeBotCall = {
-      ...activeBotCall,
-      status: accepted ? 'accepted' : 'accept-failed',
-      acceptedAt: new Date().toISOString(),
-      accept: {
+    const finalTarget = await verifyBotCallTarget(client.pupPage, {
+      callId: callInfo.id,
+      peerJid: callInfo.from,
+    });
+    const accepted = Boolean(connected.connected && finalTarget.matches);
+    if (!isCallTerminal(callInfo.id, callInfo.from)) {
+      activeBotCall = {
+        ...activeBotCall,
+        status: accepted ? 'accepted' : 'accept-failed',
+        acceptedAt: new Date().toISOString(),
+        accept: {
         ui: acceptUi,
         internal,
         connected,
-        notificationPrompt: notif,
-        chatLock,
+        finalTarget,
         screenshots: { before: beforeShot, after: afterShot },
         beforeUi: {
           callState: beforeUi.callState,
@@ -2405,49 +2892,210 @@ async function acceptIncomingCall(callInfo, { hangupAfterAudio = true } = {}) {
           callState: afterUi.callState,
           interestingButtons: (afterUi.buttons || []).filter((b) => /accept|decline|answer|reject|call|phone|tolak|terima/i.test(`${b.ariaLabel} ${b.text} ${b.dataTestId} ${b.dataIcon}`)),
         },
-      },
-    };
+        },
+      };
+    }
     logJson('info', 'call-accept-attempt', activeBotCall);
 
     if (!accepted) {
+      await teardownBotCallMedia(client.pupPage).catch(() => {});
+      revokeBotAudioGrant(callInfo.id, callInfo.from);
       return {
         success: false,
-        error: 'Call was detected but Accept UI was not clicked/connected. Popup is preserved (no dismiss/body-click/signal-only accept).',
+        error: 'Accept UI not clicked / not connected. No UI-dismiss actions were used. Official wwebjs has reject-only; experimental path is voip-stack acceptCall (PR #201825).',
         call: activeBotCall,
       };
     }
 
-    // Chrome fake-mic WAV starts when getUserMedia opens after accept.
-    let hangup = null;
-    if (hangupAfterAudio) {
-      const audioMs = await getWavDurationMs(botAudioPath);
-      const waitMs = audioMs + botHangupPaddingMs;
-      activeBotCall = { ...activeBotCall, status: 'playing-bot-audio', waitMs, audioMs };
-      logJson('info', 'call-bot-audio-wait', { audioMs, waitMs, botAudioPath });
-      await sleep(waitMs);
-      hangup = await hangupActiveCall();
-      activeBotCall = {
-        ...activeBotCall,
-        status: hangup.success ? 'completed' : 'hangup-failed',
-        completedAt: new Date().toISOString(),
-        hangup,
-      };
+    let playback = null;
+    let playbackGrant = null;
+    let audioMs = 0;
+    if (shouldInject) {
+      audioMs = await getAudioDurationMs(botAudioPath);
+      const playbackTarget = await verifyBotCallTarget(client.pupPage, {
+        callId: callInfo.id,
+        peerJid: callInfo.from,
+      });
+      if (!playbackTarget.matches || (automatic && (
+        automaticCallReservation?.id !== callInfo.id
+        || automaticCallReservation.peerJid !== serializePeerJid(callInfo.from)
+      ))) {
+        await teardownBotCallMedia(client.pupPage).catch(() => {});
+        revokeBotAudioGrant(callInfo.id, callInfo.from);
+        return {
+          success: false,
+          error: playbackTarget.matches ? 'automatic-call-reservation-lost' : playbackTarget.reason,
+          target: playbackTarget,
+          call: activeBotCall,
+        };
+      }
+      const playbackLifecycle = getBotAudioLifecycle(callInfo.id, callInfo.from, { automatic });
+      if (!playbackLifecycle.allowed) {
+        await teardownBotCallMedia(client.pupPage).catch(() => {});
+        revokeBotAudioGrant(callInfo.id, callInfo.from);
+        return { success: false, error: playbackLifecycle.reason, call: activeBotCall };
+      }
+      activeBotCall = { ...activeBotCall, status: 'playing-bot-audio', audioMs, botAudioPath, botAudioMode };
+      logJson('info', 'call-bot-audio-start', {
+        audioMs,
+        botAudioPath,
+        audioMode: botAudioMode,
+        injectAudio: shouldInject,
+      });
+
+      try {
+        if (botAudioMode === 'decoded-buffer') {
+          const wavBuf = await readFile(botAudioPath);
+          const target = await verifyBotCallTarget(client.pupPage, { callId: callInfo.id, peerJid: callInfo.from });
+          if (!target.matches) throw new Error(target.reason);
+          playback = await playBotAudioBase64(client.pupPage, wavBuf.toString('base64'), {
+            callId: callInfo.id,
+            peerJid: callInfo.from,
+          });
+          playback = { ...playback, mode: botAudioMode, bytes: wavBuf.length };
+        } else if (botAudioMode === 'media-element-stream') {
+          const target = await verifyBotCallTarget(client.pupPage, { callId: callInfo.id, peerJid: callInfo.from });
+          if (!target.matches) throw new Error(target.reason);
+          const streamUrl = issueBotAudioGrant(callInfo.id, callInfo.from, { automatic });
+          playbackGrant = activeBotAudioGrant;
+          playback = await playBotAudioUrl(client.pupPage, streamUrl, {
+            callId: callInfo.id,
+            peerJid: callInfo.from,
+          });
+          playback = { ...playback, mode: botAudioMode };
+        } else {
+          playback = { success: false, error: `Unsupported bot audio format: ${botAudioPath}`, mode: botAudioMode };
+        }
+        logJson('info', 'call-bot-audio-played', { playback, botAudioPath, audioMode: botAudioMode });
+      } catch (error) {
+        playback = { success: false, error: error.message, mode: botAudioMode };
+        logJson('error', 'call-bot-audio-play-failed', { error: error.message, botAudioPath, audioMode: botAudioMode });
+      }
+
+      const postPlaybackLifecycle = getBotAudioLifecycle(callInfo.id, callInfo.from, { automatic });
+      if (postPlaybackLifecycle.allowed) {
+        activeBotCall = {
+          ...activeBotCall,
+          status: playback?.success ? 'playing-bot-audio' : 'audio-failed',
+          playback,
+          playbackStartedAt: playback?.success ? new Date().toISOString() : null,
+        };
+      } else {
+        revokeBotAudioGrant(callInfo.id, callInfo.from);
+        await teardownBotCallMedia(client.pupPage).catch(() => {});
+        return { success: false, error: 'call-ended-during-audio-start', call: activeBotCall };
+      }
+
+      if (!playback?.success) revokeBotAudioGrant(callInfo.id, callInfo.from);
+
+      if (!playback?.success && automatic) {
+        const hangup = await hangupActiveCall(callInfo.id, callInfo.from);
+        if (!isCallTerminal(callInfo.id, callInfo.from)) {
+          activeBotCall = {
+            ...activeBotCall,
+            status: hangup.success ? 'audio-failed-hung-up' : 'audio-failed-hangup-failed',
+            hangup,
+          };
+        }
+        return { success: false, error: playback?.error || 'Bot audio playback failed.', call: activeBotCall };
+      }
+    }
+
+    if (shouldHangupAfter && playback?.success) {
+      const playedMs = Number(playback?.durationMs || playback?.durationSec * 1000 || 0);
+      let waitMs = (playedMs || audioMs) + botHangupPaddingMs;
+      if (botAudioMode === 'media-element-stream') {
+        const ended = await waitForBotAudioEnd(client.pupPage, {
+          timeoutMs: 0,
+        });
+        revokeBotAudioGrant(callInfo.id, callInfo.from);
+        playback = { ...playback, ended };
+      }
+      if (botHangupPaddingMs > 0) await sleep(botHangupPaddingMs);
+
+      const hangup = await hangupActiveCall(callInfo.id, callInfo.from);
+      if (!isCallTerminal(callInfo.id, callInfo.from)) {
+        activeBotCall = {
+          ...activeBotCall,
+          status: hangup.success ? 'completed' : 'hangup-failed',
+          completedAt: new Date().toISOString(),
+          waitMs,
+          playback,
+          hangup,
+        };
+      }
       logJson('info', 'call-bot-complete', activeBotCall);
+    } else if (!shouldInject) {
+      if (!isCallTerminal(callInfo.id, callInfo.from)) {
+        activeBotCall = {
+          ...activeBotCall,
+          status: 'accepted',
+          note: 'Accepted without bot audio inject; call left open.',
+        };
+      }
+      logJson('info', 'call-accept-open', activeBotCall);
+    } else if (!shouldHangupAfter) {
+      if (!isCallTerminal(callInfo.id, callInfo.from)) {
+        activeBotCall = {
+          ...activeBotCall,
+          status: playback?.success ? 'playing-bot-audio' : 'audio-failed',
+          note: 'Audio playback started; call remains open through and after natural audio end.',
+        };
+      }
+      logJson('info', 'call-accept-open', activeBotCall);
+      if (botAudioMode === 'media-element-stream' && playback?.success) {
+        const monitoredCallId = callInfo.id;
+        const monitoredPeerJid = callInfo.from;
+        const monitoredGrant = playbackGrant;
+        void waitForBotAudioEnd(client.pupPage, {
+          timeoutMs: 0,
+        }).then(async (ended) => {
+          if (!monitoredGrant || activeBotAudioGrant !== monitoredGrant) return;
+          revokeBotAudioGrant(monitoredCallId, monitoredPeerJid, monitoredGrant);
+          if (isCallTerminal(monitoredCallId, monitoredPeerJid)) return;
+          const state = await getBotAudioPlaybackState(client.pupPage).catch(() => ended?.state || null);
+          const monitorLifecycle = getBotAudioLifecycle(monitoredCallId, monitoredPeerJid, { automatic });
+          if (!monitorLifecycle.allowed) return;
+          activeBotCall = {
+            ...activeBotCall,
+            status: ended?.success ? 'audio-ended-call-open' : (state?.status === 'stopped' ? 'call-ended' : 'audio-monitor-failed'),
+            audioEndedAt: new Date().toISOString(),
+            playbackState: state,
+            playbackMonitor: ended,
+          };
+          logJson(ended?.success ? 'info' : 'error', 'call-bot-audio-ended', {
+            callId: monitoredCallId,
+            ended,
+            playbackState: state,
+          });
+        }).catch((error) => logJson('error', 'call-bot-audio-monitor-failed', {
+          callId: monitoredCallId,
+          error: error.message,
+        }));
+      }
     }
 
     return {
       success: true,
       call: activeBotCall,
       botAudioPath,
-      note: 'Bot audio is injected as Chrome fake microphone. Swap file via WHATSAPP_BOT_AUDIO and restart daemon.',
+      injectAudio: shouldInject,
+      hangupAfterAudio: shouldHangupAfter,
+      note: shouldInject
+        ? 'Bot audio: decoded WAV or streaming M4A → WebAudio → patched getUserMedia destination (bridge v7+). VoIP-first accept.'
+        : 'Accepted without audio inject (WHATSAPP_BOT_AUDIO_INJECT=0 or injectAudio:false).',
     };
   } catch (error) {
-    activeBotCall = {
-      ...(activeBotCall || {}),
-      status: 'error',
-      error: error.message,
-      failedAt: new Date().toISOString(),
-    };
+    await teardownBotCallMedia(client.pupPage).catch(() => {});
+    revokeBotAudioGrant(callInfo?.id || null, callInfo?.from || null);
+    if (activeBotCall?.id === callInfo?.id && !isCallTerminal(callInfo.id, callInfo.from)) {
+      activeBotCall = {
+        ...activeBotCall,
+        status: 'error',
+        error: error.message,
+        failedAt: new Date().toISOString(),
+      };
+    }
     logJson('error', 'call-accept-failed', { error: error.message, call: activeBotCall });
     return { success: false, error: error.message, call: activeBotCall };
   } finally {
@@ -2455,40 +3103,122 @@ async function acceptIncomingCall(callInfo, { hangupAfterAudio = true } = {}) {
   }
 }
 
-// Incoming call detection + optional auto-accept voice bot.
 client.on('call', async (call) => {
-  // Ignore duplicate/stale call events while a bot flow is already running.
-  if (botCallInFlight && lastCall?.id === call.id) {
-    logJson('info', 'incoming-call-duplicate-ignored', { id: call.id, from: call.from });
+  const callId = typeof call.id === 'string' ? call.id : '';
+  const peerJid = serializePeerJid(call.from);
+  if (!callId) {
+    logJson('info', 'incoming-call-detect-only', { id: null, from: peerJid, policy: { allowed: false, reason: 'missing-call-id' } });
     return;
   }
+  const duplicate = Boolean(getCallAutomationState(callId, peerJid));
+  if (duplicate) {
+    logJson('info', 'incoming-call-duplicate-ignored', {
+      id: callId,
+      from: peerJid,
+      automation: getCallAutomationState(callId, peerJid),
+    });
+    return;
+  }
+  rememberCallAutomationState(callId, 'resolving', null, peerJid);
 
   lastCall = {
-    id: call.id,
-    from: call.from,
-    isVideo: call.isVideo,
-    isGroup: call.isGroup,
+    id: callId,
+    from: peerJid,
+    fromMe: Boolean(call.fromMe),
+    isVideo: Boolean(call.isVideo),
+    isGroup: Boolean(call.isGroup),
     canHandleLocally: call.canHandleLocally,
     webClientShouldHandle: call.webClientShouldHandle,
     timestamp: new Date().toISOString(),
     // Keep library reject helper for later use.
     reject: typeof call.reject === 'function' ? call.reject.bind(call) : null,
   };
+  const detectedCall = lastCall;
   logJson('info', 'incoming-call', {
     id: lastCall.id,
     from: lastCall.from,
     isVideo: lastCall.isVideo,
     isGroup: lastCall.isGroup,
+    fromMe: lastCall.fromMe,
     canHandleLocally: lastCall.canHandleLocally,
     webClientShouldHandle: lastCall.webClientShouldHandle,
     autoAcceptCalls,
+    allowlistValid: autoAcceptCallerConfig.valid,
+    allowlistCount: allowedCallerPhones.size,
+    botAudioReady,
     headless: voiceBotHeadless,
   });
 
-  if (!autoAcceptCalls) return;
-  if (call.fromMe) return;
+  const preliminary = evaluateAutoAcceptCallPolicy({
+    autoAcceptEnabled: autoAcceptCalls,
+    allowlistValid: autoAcceptCallerConfig.valid,
+    allowedCallers: allowedCallerPhones,
+    fromMe: lastCall.fromMe,
+    isGroup: lastCall.isGroup,
+    isVideo: lastCall.isVideo,
+    audioRequired: botAudioInject,
+    audioReady: botAudioReady,
+    callAlreadyActive: isOtherAutomaticCallActive(callId, peerJid),
+    skipIdentity: true,
+    peerJid,
+  });
+  if (!preliminary.allowed) {
+    detectedCall.automationPolicy = preliminary;
+    rememberCallAutomationState(callId, 'denied', preliminary.reason, peerJid);
+    logJson('info', 'incoming-call-detect-only', { id: callId, from: peerJid, policy: preliminary });
+    return;
+  }
+  automaticCallReservation = { id: callId, peerJid };
+
+  const callerIdentity = await resolveCallPeerIdentity(peerJid);
+  const policy = evaluateAutoAcceptCallPolicy({
+    autoAcceptEnabled: autoAcceptCalls,
+    allowlistValid: autoAcceptCallerConfig.valid,
+    allowedCallers: allowedCallerPhones,
+    fromMe: detectedCall.fromMe,
+    isGroup: detectedCall.isGroup,
+    isVideo: detectedCall.isVideo,
+    audioRequired: botAudioInject,
+    audioReady: botAudioReady,
+    callAlreadyActive: automaticCallReservation?.id !== callId
+      || automaticCallReservation.peerJid !== peerJid
+      || isOtherAutomaticCallActive(callId, peerJid),
+    peerJid,
+    resolvedPhone: callerIdentity.phone || null,
+  });
+  detectedCall.callerIdentity = callerIdentity;
+  detectedCall.automationPolicy = policy;
+  if (lastCall?.id === callId && lastCall.from === peerJid) {
+    lastCall.callerIdentity = callerIdentity;
+    lastCall.automationPolicy = policy;
+  }
+  logJson('info', 'incoming-call-policy', {
+    id: callId,
+    from: peerJid,
+    callerIdentity,
+    policy,
+  });
+  if (!policy.allowed) {
+    if (automaticCallReservation?.id === callId && automaticCallReservation.peerJid === peerJid) automaticCallReservation = null;
+    rememberCallAutomationState(callId, 'denied', policy.reason, peerJid);
+    return;
+  }
+
+  rememberCallAutomationState(callId, 'accepting', policy.reason, peerJid);
   // Fire-and-forget so the event handler doesn't block other call updates.
-  void acceptIncomingCall(lastCall, { hangupAfterAudio: true });
+  // inject/hangup follow WHATSAPP_BOT_AUDIO_INJECT + WHATSAPP_BOT_HANGUP_AFTER_AUDIO.
+  void acceptIncomingCall(detectedCall, {
+    hangupAfterAudio: botHangupAfterAudio,
+    injectAudio: botAudioInject,
+    automatic: true,
+  }).then((result) => {
+    rememberCallAutomationState(callId, result?.success ? 'active' : 'failed', result?.error || null, peerJid);
+    if (!result?.success && automaticCallReservation?.id === callId && automaticCallReservation.peerJid === peerJid) automaticCallReservation = null;
+  }).catch((error) => {
+    if (automaticCallReservation?.id === callId && automaticCallReservation.peerJid === peerJid) automaticCallReservation = null;
+    rememberCallAutomationState(callId, 'failed', error.message, peerJid);
+    logJson('error', 'incoming-call-automation-failed', { id: callId, error: error.message });
+  });
 });
 
 async function socketIsActive() {
@@ -2526,6 +3256,7 @@ async function shutdown(signal, exitCode = 0) {
     new Promise((resolve) => httpServer?.close(resolve) || resolve()),
     new Promise((resolve) => setTimeout(resolve, 2000)),
   ]);
+  await teardownBotCallMedia(client.pupPage).catch(() => {});
   await client.destroy().catch(() => {});
   await rm(paths.socket, { force: true });
   await removeQr();
@@ -2537,14 +3268,27 @@ async function main() {
   log.info('start', `chrome=${chromePath}`);
   logJson('info', 'voice-bot-config', {
     autoAcceptCalls,
+    botAudioInject,
+    botHangupAfterAudio,
     botAudioPath,
+    botAudioMode,
+    allowlistValid: autoAcceptCallerConfig.valid,
+    allowlistCount: allowedCallerPhones.size,
+    invalidAllowlistEntryCount: autoAcceptCallerConfig.invalidEntries.length,
     botHangupPaddingMs,
     headless: voiceBotHeadless,
   });
-  try {
-    await lstat(botAudioPath);
-  } catch (error) {
-    log.error('voice-bot-audio-missing', `${botAudioPath}: ${error.message}`);
+  if (botAudioInject) {
+    try {
+      const metadata = await getBotAudioMetadata();
+      botAudioReady = true;
+      logJson('info', 'voice-bot-audio-ready', metadata);
+    } catch (error) {
+      botAudioReady = false;
+      log.error('voice-bot-audio-missing', `${botAudioPath}: ${error.message}`);
+    }
+  } else {
+    botAudioReady = true;
   }
   await ensurePrivateDirectories();
   await removeQr();
@@ -2590,8 +3334,23 @@ async function main() {
   // Start HTTP API server for Web UI (no fingerprint required)
   const app = express();
   app.use(express.json());
-  
-  // CORS for local dev
+
+  // Narrow browser Private Network Access only to the per-call audio grant.
+  app.options('/api/internal/call-audio/:token', (req, res) => {
+    if (req.headers.origin !== 'https://web.whatsapp.com') return res.status(403).end();
+    if (!requestHasActiveBotAudioGrant(req)) return res.status(404).end();
+    res.setHeader('Access-Control-Allow-Origin', 'https://web.whatsapp.com');
+    res.setHeader('Access-Control-Allow-Headers', 'Range');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+    res.setHeader('Vary', 'Origin');
+    return res.sendStatus(204);
+  });
+  app.get('/api/internal/call-audio/:token', serveBotAudio);
+  app.head('/api/internal/call-audio/:token', serveBotAudio);
+
+  // Existing Web UI CORS behavior. Never opt these general APIs into browser
+  // Private Network Access; the call-audio route handles its own narrow policy.
   app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Headers', 'Content-Type');
@@ -2855,13 +3614,12 @@ async function main() {
   });
 
   // Multi-account: each daemon binds its own localhost HTTP port from the account id.
-  const HTTP_PORT = resolveHttpPort(accountId);
   httpServer = http.createServer(app);
   await new Promise((resolve, reject) => {
     httpServer.once('error', reject);
-    httpServer.listen(HTTP_PORT, '127.0.0.1', resolve);
+    httpServer.listen(httpPort, '127.0.0.1', resolve);
   });
-  log.info('http-api-ready', `account=${accountId || 'default'} port=${HTTP_PORT} url=http://localhost:${HTTP_PORT}`);
+  log.info('http-api-ready', `account=${accountId || 'default'} port=${httpPort} url=http://localhost:${httpPort}`);
 
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));
