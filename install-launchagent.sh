@@ -148,8 +148,8 @@ $(if [[ -n "$ACCOUNT_ID" ]]; then printf '    <string>--account</string>\n    <s
     <key>WHATSAPP_APPROVAL_HELPER</key><string>${APPROVAL_HELPER}</string>
     <key>WHATSAPP_ACCOUNT_ID</key><string>${ACCOUNT_ID}</string>
     <key>WHATSAPP_HTTP_PORT</key><string>${HTTP_PORT}</string>
-    <!-- Run Chrome invisibly in the LaunchAgent session. -->
-    <key>WHATSAPP_HEADLESS</key><string>1</string>
+    <!-- Chrome is ALWAYS headless by default. Set WHATSAPP_DEBUG=1 only for testing/debugging. -->
+    <!-- <key>WHATSAPP_DEBUG</key><string>0</string> -->
     <!-- Voice-bot toggles (set any to 0 to disable; reinstall/restart after edit). -->
     <key>WHATSAPP_AUTO_ACCEPT_CALLS</key><string>1</string>
     <key>WHATSAPP_BOT_AUDIO_INJECT</key><string>1</string>
