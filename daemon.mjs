@@ -32,9 +32,11 @@ import {
   readPowerSessionState,
 } from './lib/lock-power-guard.mjs';
 import {
-  buildProcessStatus,
+  buildBrowserLifecycleStatus,
+  IDLE_COLD_PHASE,
+  isIdleColdPhase,
   methodNeedsBrowser,
-  parseBrowserIdleMs,
+  parseIdleChromeMs,
   parseBrowserPolicy,
   parseMaxHotBrowsers,
   shouldIdleCloseBrowser,
@@ -142,10 +144,11 @@ const acknowledgementHistory = new Map();
 //
 // Chrome is ALWAYS headless unless WHATSAPP_DEBUG=1 is set.
 //
-// Browser memory policy (default: idle):
+// Browser memory policy (default: idle) — same contract as instaseal:
 //   BROWSER_POLICY=always|idle|on_demand
-//   BROWSER_IDLE_MS=600000          → close Chrome after N ms without WA RPC
+//   IDLE_CHROME_MS=900000           → close Chrome after N ms without WA RPC (0 = never)
 //   MAX_HOT_BROWSERS=1              → soft per-tool documentation cap
+// Status: chromeAlive, browserPolicy, idleChromeMs, idleForMs, lastRpcAt; cold phase idle_cold
 //
 // Audio file:
 //   WHATSAPP_BOT_AUDIO=/abs/path.wav|m4a
@@ -239,11 +242,13 @@ let pausedByLock = false;
 let lockPowerGuard = null;
 let browserInitInFlight = null;
 // Idle / on-demand browser lifecycle: Node + socket stay up; Chrome is optional.
+// Contract mirrors instaseal: BROWSER_POLICY + IDLE_CHROME_MS + chromeAlive/idle_cold.
 const browserPolicy = parseBrowserPolicy(process.env);
-const browserIdleMs = parseBrowserIdleMs(process.env);
+const idleChromeMs = parseIdleChromeMs(process.env);
 const maxHotBrowsers = parseMaxHotBrowsers(process.env);
-let browserOpen = false;
-let lastActivityAt = Date.now();
+/** @type {boolean} chromeAlive — true while Chromium session is open for WA. */
+let chromeAlive = false;
+let lastRpcAt = Date.now();
 let idleTimer = null;
 let idleCloseInFlight = null;
 let clientGeneration = 0;
@@ -333,10 +338,13 @@ function isBrowserSessionCurrent(generation) {
   return generation === clientGeneration && client != null;
 }
 
-function touchActivity(at = Date.now()) {
-  lastActivityAt = Number(at) || Date.now();
+function touchRpcActivity(at = Date.now()) {
+  lastRpcAt = Number(at) || Date.now();
   scheduleIdleBrowserClose();
 }
+
+/** @deprecated alias */
+const touchActivity = touchRpcActivity;
 
 function clearIdleTimer() {
   if (idleTimer) {
@@ -348,12 +356,12 @@ function clearIdleTimer() {
 function scheduleIdleBrowserClose() {
   clearIdleTimer();
   if (browserPolicy === 'always') return;
-  if (!Number.isFinite(browserIdleMs) || browserIdleMs <= 0) return;
+  if (!Number.isFinite(idleChromeMs) || idleChromeMs <= 0) return;
   if (pausedByLock || phase === 'paused_by_lock' || shuttingDown) return;
-  if (!browserOpen || phase !== 'ready') return;
+  if (!chromeAlive || phase !== 'ready') return;
   idleTimer = setTimeout(() => {
     void maybeIdleCloseBrowser();
-  }, browserIdleMs);
+  }, idleChromeMs);
   if (typeof idleTimer.unref === 'function') idleTimer.unref();
 }
 
@@ -366,18 +374,38 @@ function processStatusSnapshot() {
   }
   const canWake = !pausedByLock
     && !shuttingDown
-    && (phase === 'idle_no_browser' || phase === 'starting' || (!browserOpen && phase !== 'auth-failure'));
-  return buildProcessStatus({
+    && (isIdleColdPhase(phase) || phase === 'starting' || (!chromeAlive && phase !== 'auth-failure'));
+  return buildBrowserLifecycleStatus({
     policy: browserPolicy,
-    idleMs: browserIdleMs,
+    idleChromeMs,
     now: Date.now(),
-    lastActivityAt,
-    browserOpen,
+    lastRpcAt,
+    chromeAlive,
     phase,
     pausedByLock,
     nodeRssBytes,
-    canWake: Boolean(canWake || (browserOpen && phase === 'ready')),
+    canWake: Boolean(canWake || (chromeAlive && phase === 'ready')),
   });
+}
+
+/** instaseal-compatible browser lifecycle fields for status / publishState. */
+function browserContractFields(processStatus = processStatusSnapshot()) {
+  return {
+    browserPolicy,
+    chromeAlive: Boolean(processStatus.chromeAlive ?? chromeAlive),
+    chrome_alive: Boolean(processStatus.chromeAlive ?? chromeAlive),
+    idleChromeMs,
+    lastRpcAt: processStatus.lastRpcAt,
+    idleForMs: processStatus.idleForMs,
+    idle_for_ms: processStatus.idleForMs,
+    browserLifecycle: processStatus,
+    // legacy aliases
+    browserOpen: Boolean(processStatus.chromeAlive ?? chromeAlive),
+    browserIdleMs: idleChromeMs,
+    canWake: processStatus.canWake,
+    lastActivityAt: processStatus.lastRpcAt,
+    process: processStatus,
+  };
 }
 
 function lockPowerStatusSnapshot() {
@@ -412,7 +440,7 @@ async function publishState(extra = {}) {
   stateWriteQueue = stateWriteQueue.catch(() => {}).then(() => writeJsonAtomic(paths.stateFile, {
       phase,
       connectionState,
-      ready: phase === 'ready' && !pausedByLock && browserOpen,
+      ready: phase === 'ready' && !pausedByLock && chromeAlive,
       qrAvailable: phase === 'pairing' && !pausedByLock,
       qrPath: phase === 'pairing' && !pausedByLock ? paths.qrFile : null,
       qrUpdatedAt,
@@ -420,13 +448,8 @@ async function publishState(extra = {}) {
       pid: process.pid,
       pausedByLock,
       paused_by_lock: pausedByLock,
-      browserOpen,
-      browserPolicy,
-      browserIdleMs,
       maxHotBrowsers,
-      canWake: processStatus.canWake,
-      lastActivityAt: processStatus.lastActivityAt,
-      process: processStatus,
+      ...browserContractFields(processStatus),
       lockPower,
       updatedAt: new Date().toISOString(),
       ...extra,
@@ -454,7 +477,7 @@ function stopHotTimers() {
 async function destroyBrowserSession(reason = 'destroy') {
   stopHotTimers();
   const current = client;
-  browserOpen = false;
+  chromeAlive = false;
   browserInitInFlight = null;
   if (!current) return;
   try {
@@ -480,14 +503,15 @@ async function destroyBrowserSession(reason = 'destroy') {
 async function maybeIdleCloseBrowser() {
   if (idleCloseInFlight) return idleCloseInFlight;
   idleCloseInFlight = (async () => {
+    // paused_by_lock always wins over idle_cold (shouldIdleCloseBrowser gates this).
     const decision = shouldIdleCloseBrowser({
       policy: browserPolicy,
-      idleMs: browserIdleMs,
+      idleChromeMs,
       now: Date.now(),
-      lastActivityAt,
+      lastRpcAt,
       phase,
       pausedByLock,
-      browserOpen,
+      chromeAlive,
       hasActiveBotCall: Boolean(activeBotCall || botCallInFlight),
       sendApprovalInFlight,
     });
@@ -498,16 +522,17 @@ async function maybeIdleCloseBrowser() {
     logJson('info', 'browser-idle-close-start', {
       reason: decision.reason,
       idleForMs: decision.idleForMs,
-      idleMs: decision.idleMs,
+      idleChromeMs: decision.idleChromeMs ?? idleChromeMs,
       policy: browserPolicy,
     });
-    phase = 'idle_no_browser';
-    connectionState = 'IDLE_NO_BROWSER';
+    phase = IDLE_COLD_PHASE;
+    connectionState = 'IDLE_COLD';
     await destroyBrowserSession('idle');
     await publishState();
     logJson('info', 'browser-idle-closed', {
       note: 'Chrome stopped after idle; control socket remains; next WA RPC will wake',
       canWake: true,
+      phase: IDLE_COLD_PHASE,
     });
   })().finally(() => {
     idleCloseInFlight = null;
@@ -1302,7 +1327,7 @@ async function installCallEndedBinding() {
 }
 
 async function finalizeReady(source) {
-  if (phase === 'ready' && browserOpen && client) return;
+  if (phase === 'ready' && chromeAlive && client) return;
   if (readyFinalizationInFlight) return await readyFinalizationInFlight;
   readyFinalizationInFlight = (async () => {
     if (!client) throw new Error('No WhatsApp client is available to finalize ready.');
@@ -1317,7 +1342,7 @@ async function finalizeReady(source) {
     if (authenticatedRecoveryTimer) clearTimeout(authenticatedRecoveryTimer);
     authenticatedRecoveryTimer = null;
     phase = 'ready';
-    browserOpen = true;
+    chromeAlive = true;
     readyAt = new Date().toISOString();
     connectionState = state;
     touchActivity();
@@ -1366,9 +1391,9 @@ async function finalizeReady(source) {
           if (
             pausedByLock
             || phase === 'paused_by_lock'
-            || phase === 'idle_no_browser'
+            || isIdleColdPhase(phase)
             || shuttingDown
-            || !browserOpen
+            || !chromeAlive
             || !client
           ) {
             return;
@@ -1385,16 +1410,16 @@ async function finalizeReady(source) {
           if (
             pausedByLock
             || phase === 'paused_by_lock'
-            || phase === 'idle_no_browser'
+            || isIdleColdPhase(phase)
             || shuttingDown
-            || !browserOpen
+            || !chromeAlive
           ) {
             return;
           }
           log.error('health-check-failed', truncateText(error?.message || String(error), 300));
           await shutdown('health-check', 1);
         }
-      }, 30000);
+      }, 90_000); // warm health poll 60–120s (prefer ~90s)
       healthTimer.unref();
     }
     scheduleIdleBrowserClose();
@@ -1414,7 +1439,7 @@ function scheduleAuthenticatedRecovery(delayMs = 5000) {
 
 async function recoverAuthenticatedInitialization() {
   if (authenticatedRecoveryInFlight || phase !== 'authenticated') return;
-  // authenticated phase has a live Client before finalizeReady sets browserOpen.
+  // authenticated phase has a live Client before finalizeReady sets chromeAlive.
   if (!client || pausedByLock || phase === 'paused_by_lock' || shuttingDown) {
     return;
   }
@@ -1460,21 +1485,21 @@ async function recoverAuthenticatedInitialization() {
   }
 }
 
-async function ensureReady() {
+async function ensureReady(reason = 'rpc') {
   if (pausedByLock || phase === 'paused_by_lock') {
     throw new Error('WhatsApp backend is paused_by_lock (screen locked or lid closed). Unlock/open lid to resume.');
   }
-  touchActivity();
-  if (phase === 'ready' && browserOpen && client) return;
+  touchRpcActivity();
+  if (phase === 'ready' && chromeAlive && client) return;
 
-  // Idle / on-demand: cold-start Chrome on first method that needs WhatsApp.
+  // Idle / on-demand: cold-start Chrome on first method that needs WhatsApp (lazy warm).
   if (
-    phase === 'idle_no_browser'
+    isIdleColdPhase(phase)
     || phase === 'starting'
     || phase === 'resuming_after_lock'
-    || (!browserOpen && phase !== 'pairing' && phase !== 'authenticated' && phase !== 'auth-failure')
+    || (!chromeAlive && phase !== 'pairing' && phase !== 'authenticated' && phase !== 'auth-failure')
   ) {
-    logJson('info', 'browser-wake-start', { phase, policy: browserPolicy });
+    logJson('info', 'browser-ensure-start', { reason, phase, policy: browserPolicy, idleChromeMs });
     phase = 'starting';
     await publishState();
     await initializeBrowserSession();
@@ -1484,8 +1509,8 @@ async function ensureReady() {
       if (pausedByLock || phase === 'paused_by_lock') {
         throw new Error('WhatsApp backend is paused_by_lock (screen locked or lid closed). Unlock/open lid to resume.');
       }
-      if (phase === 'ready' && browserOpen && client) {
-        touchActivity();
+      if (phase === 'ready' && chromeAlive && client) {
+        touchRpcActivity();
         return;
       }
       if (phase === 'pairing') {
@@ -1502,10 +1527,13 @@ async function ensureReady() {
     throw new Error(`WhatsApp backend wake timed out (phase=${phase}).`);
   }
 
-  if (phase !== 'ready' || !browserOpen || !client) {
+  if (phase !== 'ready' || !chromeAlive || !client) {
     throw new Error(`WhatsApp backend is not ready (phase=${phase}). Pair the linked device first.`);
   }
 }
+
+/** instaseal-compatible name for lazy browser warm. */
+const ensureBrowser = ensureReady;
 
 async function resolveChat(target) {
   const value = String(target || '').trim();
@@ -1652,7 +1680,7 @@ async function dispatch(method, params = {}) {
     const processStatus = processStatusSnapshot();
     return {
       phase,
-      ready: phase === 'ready' && !pausedByLock && browserOpen,
+      ready: phase === 'ready' && !pausedByLock && chromeAlive,
       connectionState,
       qrAvailable: phase === 'pairing' && !pausedByLock,
       qrPath: phase === 'pairing' && !pausedByLock ? paths.qrFile : null,
@@ -1661,13 +1689,8 @@ async function dispatch(method, params = {}) {
       pid: process.pid,
       pausedByLock,
       paused_by_lock: pausedByLock,
-      browserOpen,
-      browserPolicy,
-      browserIdleMs,
       maxHotBrowsers,
-      canWake: processStatus.canWake,
-      lastActivityAt: processStatus.lastActivityAt,
-      process: processStatus,
+      ...browserContractFields(processStatus),
       lockPower,
     };
   }
@@ -2220,9 +2243,9 @@ function bindClientLifecycleEvents(session, generation) {
     if (
       pausedByLock
       || phase === 'paused_by_lock'
-      || phase === 'idle_no_browser'
+      || isIdleColdPhase(phase)
       || shuttingDown
-      || !browserOpen
+      || !chromeAlive
     ) {
       log.info('auth-failure-ignored-during-intentional-teardown', truncateText(message, 200));
       return;
@@ -2236,7 +2259,7 @@ function bindClientLifecycleEvents(session, generation) {
 
   session.on('change_state', async (state) => {
     if (!isBrowserSessionCurrent(generation)) return;
-    if (pausedByLock || phase === 'paused_by_lock' || phase === 'idle_no_browser' || !browserOpen) return;
+    if (pausedByLock || phase === 'paused_by_lock' || isIdleColdPhase(phase) || !chromeAlive) return;
     connectionState = state;
     await publishState();
     log.debug('connection-state', state);
@@ -2251,9 +2274,9 @@ function bindClientLifecycleEvents(session, generation) {
     if (
       pausedByLock
       || phase === 'paused_by_lock'
-      || phase === 'idle_no_browser'
+      || isIdleColdPhase(phase)
       || shuttingDown
-      || !browserOpen
+      || !chromeAlive
     ) {
       log.info('disconnected-ignored-during-intentional-teardown', String(reason));
       return;
@@ -2269,12 +2292,12 @@ function bindClientLifecycleEvents(session, generation) {
 
   session.on('call', async (call) => {
     if (!isBrowserSessionCurrent(generation)) return;
-    if (pausedByLock || phase === 'paused_by_lock' || phase === 'idle_no_browser' || !browserOpen || shuttingDown) {
+    if (pausedByLock || phase === 'paused_by_lock' || isIdleColdPhase(phase) || !chromeAlive || shuttingDown) {
       logJson('info', 'incoming-call-ignored-browser-unavailable', {
         id: typeof call.id === 'string' ? call.id : null,
         from: serializePeerJid(call.from),
         phase,
-        browserOpen,
+        chromeAlive,
       });
       return;
     }
@@ -3703,7 +3726,7 @@ async function initializeBrowserSession() {
     log.info('browser-initialize-skipped', 'paused_by_lock_or_shutdown');
     return;
   }
-  if (phase === 'ready' && browserOpen && client) return;
+  if (phase === 'ready' && chromeAlive && client) return;
   if (browserInitInFlight) return browserInitInFlight;
   browserInitInFlight = (async () => {
     // Recreate Client after idle/lock destroy — re-initialize on a dead Client is unreliable.
@@ -3727,12 +3750,12 @@ async function initializeBrowserSession() {
         client.initialize(),
         new Promise((_, reject) => setTimeout(() => reject(new Error('WhatsApp initialization exceeded 180 seconds.')), 180000)),
       ]);
-      if (pausedByLock || shuttingDown || phase === 'idle_no_browser') {
+      if (pausedByLock || shuttingDown || isIdleColdPhase(phase)) {
         log.info('browser-initialize-aborted-after-policy', 'discarding session started before pause/idle');
         await destroyBrowserSession('init-aborted');
       }
     } catch (error) {
-      if (pausedByLock || shuttingDown || phase === 'idle_no_browser') {
+      if (pausedByLock || shuttingDown || isIdleColdPhase(phase)) {
         log.info('browser-initialize-cancelled', truncateText(error?.message || String(error), 200));
         return;
       }
@@ -3848,17 +3871,12 @@ async function main() {
         ok: true,
         result: {
           phase,
-          ready: phase === 'ready' && !pausedByLock && browserOpen,
+          ready: phase === 'ready' && !pausedByLock && chromeAlive,
           connectionState,
           pausedByLock,
           paused_by_lock: pausedByLock,
-          browserOpen,
-          browserPolicy,
-          browserIdleMs,
           maxHotBrowsers,
-          canWake: processStatus.canWake,
-          lastActivityAt: processStatus.lastActivityAt,
-          process: processStatus,
+          ...browserContractFields(processStatus),
           lockPower: lockPowerStatusSnapshot(),
         },
       });
@@ -4128,8 +4146,8 @@ async function main() {
     if (
       pausedByLock
       || phase === 'paused_by_lock'
-      || phase === 'idle_no_browser'
-      || (!browserOpen && phase !== 'failed' && phase !== 'disconnected')
+      || isIdleColdPhase(phase)
+      || (!chromeAlive && phase !== 'failed' && phase !== 'disconnected')
     ) return;
     void shutdown('uncaughtException', 1);
   });
@@ -4138,8 +4156,8 @@ async function main() {
     if (
       pausedByLock
       || phase === 'paused_by_lock'
-      || phase === 'idle_no_browser'
-      || (!browserOpen && phase !== 'failed' && phase !== 'disconnected')
+      || isIdleColdPhase(phase)
+      || (!chromeAlive && phase !== 'failed' && phase !== 'disconnected')
     ) return;
     void shutdown('unhandledRejection', 1);
   });
@@ -4169,7 +4187,7 @@ async function main() {
 
   logJson('info', 'browser-policy-config', {
     policy: browserPolicy,
-    idleMs: browserIdleMs,
+    idleChromeMs,
     maxHotBrowsers,
     startOnBoot: shouldStartBrowserOnBoot(browserPolicy),
   });
@@ -4181,13 +4199,15 @@ async function main() {
   }
 
   if (!shouldStartBrowserOnBoot(browserPolicy)) {
-    phase = 'idle_no_browser';
-    connectionState = 'IDLE_NO_BROWSER';
-    browserOpen = false;
+    phase = IDLE_COLD_PHASE;
+    connectionState = 'IDLE_COLD';
+    chromeAlive = false;
     await publishState();
     logJson('info', 'browser-on-demand-idle', {
-      note: 'Control socket up; Chrome starts on first WhatsApp RPC',
+      note: 'Control socket up; Chrome starts on first WhatsApp RPC (ensureBrowser)',
       policy: browserPolicy,
+      idleChromeMs,
+      phase: IDLE_COLD_PHASE,
     });
     return;
   }

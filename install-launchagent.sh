@@ -33,10 +33,17 @@ LOCK_POWER_GUARD="${LOCK_POWER_GUARD:-1}"
 LOCK_POWER_GUARD_INTERVAL_MS="${LOCK_POWER_GUARD_INTERVAL_MS:-5000}"
 # Optional smoke-test override: locked|unlocked. Leave empty in production installs.
 LOCK_POWER_GUARD_FORCE="${LOCK_POWER_GUARD_FORCE:-}"
-# Browser memory policy (default idle): keep control socket, close Chrome after inactivity.
+# Browser memory policy (default idle) — same contract as instaseal:
 # always = Chrome always hot; idle = warm start then idle-close; on_demand = cold until first WA RPC.
+# IDLE_CHROME_MS default 15m; 0 disables idle-close. Legacy BROWSER_IDLE_MS still accepted.
 BROWSER_POLICY="${BROWSER_POLICY:-idle}"
-BROWSER_IDLE_MS="${BROWSER_IDLE_MS:-600000}"
+if [[ -n "${IDLE_CHROME_MS:-}" ]]; then
+  :
+elif [[ -n "${BROWSER_IDLE_MS:-}" ]]; then
+  IDLE_CHROME_MS="$BROWSER_IDLE_MS"
+else
+  IDLE_CHROME_MS="900000"
+fi
 MAX_HOT_BROWSERS="${MAX_HOT_BROWSERS:-1}"
 
 log() { printf '%s script=whatsapp-launchagent pid=%s event=%s detail=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$1" "${2:-}"; }
@@ -69,6 +76,8 @@ Options:
                  operates on the legacy single-account instance.
 
 Verbose mode prints every external command and decision branch.
+
+Memory defaults: BROWSER_POLICY=idle, IDLE_CHROME_MS=900000 (15m). Use always|idle|on_demand.
 EOF
 }
 
@@ -155,7 +164,7 @@ show_status() {
   log "progress" "[1/3] 33% — checking private control socket"
   if [[ -S "$STATE_DIR/control.sock" ]]; then printf 'socket=present:%s\n' "$STATE_DIR/control.sock"; else printf 'socket=missing\n'; fi
   log "progress" "[2/3] 66% — checking backend state"
-  if [[ -f "$STATE_DIR/status.json" ]]; then run "$NODE_BIN" -e 'const fs=require("fs"); const p=process.argv[1]; const s=JSON.parse(fs.readFileSync(p)); console.log(`phase=${s.phase||"unknown"}`); console.log(`ready=${Boolean(s.ready)}`); console.log(`qrAvailable=${Boolean(s.qrAvailable)}`); console.log(`paused_by_lock=${Boolean(s.paused_by_lock||s.pausedByLock)}`); console.log(`browserOpen=${Boolean(s.browserOpen)}`); console.log(`browserPolicy=${s.browserPolicy||s.process?.policy||"unknown"}`); console.log(`canWake=${Boolean(s.canWake||s.process?.canWake)}`); if(s.lockPower){console.log(`lock_power_enabled=${Boolean(s.lockPower.enabled)}`); if(s.lockPower.reason) console.log(`lock_power_reason=${s.lockPower.reason}`);} if(s.qrPath) console.log(`qrPath=${s.qrPath}`)' "$STATE_DIR/status.json"; else printf 'phase=unknown\n'; fi
+  if [[ -f "$STATE_DIR/status.json" ]]; then run "$NODE_BIN" -e 'const fs=require("fs"); const p=process.argv[1]; const s=JSON.parse(fs.readFileSync(p)); console.log(`phase=${s.phase||"unknown"}`); console.log(`ready=${Boolean(s.ready)}`); console.log(`qrAvailable=${Boolean(s.qrAvailable)}`); console.log(`paused_by_lock=${Boolean(s.paused_by_lock||s.pausedByLock)}`); console.log(`chromeAlive=${Boolean(s.chromeAlive??s.chrome_alive??s.browserOpen)}`); console.log(`browserPolicy=${s.browserPolicy||s.browserLifecycle?.policy||s.process?.policy||"unknown"}`); console.log(`idleChromeMs=${s.idleChromeMs??s.browserLifecycle?.idleChromeMs??""}`); console.log(`canWake=${Boolean(s.canWake||s.process?.canWake||s.browserLifecycle?.canWake)}`); if(s.lockPower){console.log(`lock_power_enabled=${Boolean(s.lockPower.enabled)}`); if(s.lockPower.reason) console.log(`lock_power_reason=${s.lockPower.reason}`);} if(s.qrPath) console.log(`qrPath=${s.qrPath}`)' "$STATE_DIR/status.json"; else printf 'phase=unknown\n'; fi
   log "progress" "[3/3] 100% — status complete"
 }
 
@@ -230,9 +239,9 @@ ${account_args}
     <key>LOCK_POWER_GUARD</key><string>${LOCK_POWER_GUARD}</string>
     <key>LOCK_POWER_GUARD_INTERVAL_MS</key><string>${LOCK_POWER_GUARD_INTERVAL_MS}</string>
   ${force_entry}
-    <!-- Browser memory policy (default idle). always|idle|on_demand -->
+    <!-- Browser memory policy (default idle). always|idle|on_demand; IDLE_CHROME_MS default 15m -->
     <key>BROWSER_POLICY</key><string>${BROWSER_POLICY}</string>
-    <key>BROWSER_IDLE_MS</key><string>${BROWSER_IDLE_MS}</string>
+    <key>IDLE_CHROME_MS</key><string>${IDLE_CHROME_MS}</string>
     <key>MAX_HOT_BROWSERS</key><string>${MAX_HOT_BROWSERS}</string>
   </dict>
   <key>Umask</key><integer>63</integer>
@@ -352,8 +361,8 @@ case "$ACTION" in
     elif [[ "$BROWSER_POLICY" == "hot" ]]; then
       BROWSER_POLICY="always"
     fi
-    [[ "$BROWSER_IDLE_MS" =~ ^[0-9]+$ ]] || fail "BROWSER_IDLE_MS must be a non-negative integer"
-    (( BROWSER_IDLE_MS <= 86400000 )) || fail "BROWSER_IDLE_MS must not exceed 86400000 (24h)"
+    [[ "$IDLE_CHROME_MS" =~ ^[0-9]+$ ]] || fail "IDLE_CHROME_MS must be a non-negative integer"
+    (( IDLE_CHROME_MS <= 86400000 )) || fail "IDLE_CHROME_MS must not exceed 86400000 (24h)"
     [[ "$MAX_HOT_BROWSERS" =~ ^[0-9]+$ ]] || fail "MAX_HOT_BROWSERS must be a positive integer"
     (( MAX_HOT_BROWSERS >= 1 && MAX_HOT_BROWSERS <= 8 )) || fail "MAX_HOT_BROWSERS must be between 1 and 8"
     if [[ -n "$VOICE_BOT_AUDIO" ]]; then

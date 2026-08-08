@@ -23,10 +23,12 @@ biometric approval.
   after unlock + lid open. Disable only if needed with `LOCK_POWER_GUARD=0`.
   No caffeinate / prevent-sleep keep-alives are used.
 - **Low-memory browser policy (default `idle`):** the Node control socket stays up,
-  but Chrome is closed after `BROWSER_IDLE_MS` without WhatsApp RPC (default 10
-  minutes). The next WA method cold-starts the browser. Use `BROWSER_POLICY=always`
-  only when you need zero wake latency; `on_demand` keeps Chrome closed until the
-  first WA RPC even after unlock. Soft cap docs: `MAX_HOT_BROWSERS=1`.
+  but Chrome is closed after `IDLE_CHROME_MS` without WhatsApp RPC (default 15
+  minutes; `0` disables idle-close). The next WA method cold-starts via `ensureBrowser`/`ensureReady`.
+  Use `BROWSER_POLICY=always` only when you need zero wake latency; `on_demand` keeps
+  Chrome closed until the first WA RPC even after unlock. Soft cap docs: `MAX_HOT_BROWSERS=1`.
+  Status contract (shared with instaseal): `chromeAlive`, `browserPolicy`, `idleChromeMs`,
+  `idleForMs`, `lastRpcAt`; cold phase `idle_cold`. `paused_by_lock` always wins over idle.
 - The control interface is a Unix-domain socket with mode `0600`; there is no
   TCP listener.
 - A sensitive, persistent WhatsApp browser profile lives under
@@ -185,7 +187,7 @@ and evolving surface, so verify this behavior after dependency or WhatsApp updat
 Every script supports `--verbose` / `-v`.
 
 - Status: `./install-launchagent.sh status`
-- Live status (includes `paused_by_lock` / `lockPower` / `browserOpen` / `process`): `node cli.mjs status --account alpha`
+- Live status (includes `paused_by_lock` / `lockPower` / `chromeAlive` / `idleChromeMs`): `node cli.mjs status --account alpha`
 - Version report: `node cli.mjs compatibility`
 - Content-free upgrade test: `node cli.mjs compatibility-self-test`
 - Approve a reviewed machine-local tuple: `node approve-baseline.mjs --approve-current`
@@ -225,26 +227,30 @@ resume without manual stop/start.
 
 | Policy | Behavior |
 | --- | --- |
-| `idle` (default) | Warm-start Chrome after unlock; close it after `BROWSER_IDLE_MS` with no WA RPC; next RPC wakes |
+| `idle` (default) | Warm-start Chrome after unlock; close it after `IDLE_CHROME_MS` with no WA RPC; next RPC wakes |
 | `always` | Keep Chrome hot while unlocked (highest memory) |
 | `on_demand` | Do not open Chrome on boot/unlock; open only on first WA RPC |
 
 ```bash
-# default install is already idle + 10 minutes
+# default install is already idle + 15 minutes
 ./install-launchagent.sh install --account alpha
 
 # shorter idle for smoke tests
-BROWSER_IDLE_MS=60000 ./install-launchagent.sh install --account alpha
-node cli.mjs status --account alpha   # process.browserOpen / process.idleForSec
+IDLE_CHROME_MS=60000 ./install-launchagent.sh install --account alpha
+node cli.mjs status --account alpha   # chromeAlive / idleForMs / phase=idle_cold
 
 # cold until first use
 BROWSER_POLICY=on_demand ./install-launchagent.sh install --account alpha
+
+# stop unused accounts instead of leaving warm Chrome forever
+./install-launchagent.sh stop --account alpha
 ```
 
-Status fields: `browserOpen`, `browserPolicy`, `canWake`, `process`
-(`nodeRssMb`, `idleForSec`, `lastActivityAt`). Call automation only works while
+Status fields (instaseal-compatible): `chromeAlive`, `browserPolicy`, `idleChromeMs`,
+`idleForMs`, `lastRpcAt`, cold phase `idle_cold`. Call automation only works while
 Chrome is open; with `idle`/`on_demand`, missed ringing during cold periods is
-expected.
+expected. Auto-accept / call-bot stay OFF by default. Prefer stopping unused accounts
+rather than multi-profile / always-hot Chromes.
 
 All dependency installs use `npm ci --ignore-scripts` against the committed
 lockfile. There is no automatic dependency update. Runtime or lockfile drift

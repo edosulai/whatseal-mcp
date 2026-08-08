@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  buildProcessStatus,
+  buildBrowserLifecycleStatus,
+  isIdleColdPhase,
   methodNeedsBrowser,
-  parseBrowserIdleMs,
+  parseIdleChromeMs,
   parseBrowserPolicy,
   parseMaxHotBrowsers,
   shouldIdleCloseBrowser,
@@ -19,10 +20,12 @@ test('browser policy defaults to idle and accepts aliases', () => {
   assert.equal(parseBrowserPolicy({ BROWSER_POLICY: 'nope' }), 'idle');
 });
 
-test('idle ms and max hot browsers parse safely', () => {
-  assert.equal(parseBrowserIdleMs({}), 600_000);
-  assert.equal(parseBrowserIdleMs({ BROWSER_IDLE_MS: '0' }), 0);
-  assert.equal(parseBrowserIdleMs({ BROWSER_IDLE_MS: 'bogus' }), 600_000);
+test('IDLE_CHROME_MS defaults to 15m; legacy BROWSER_IDLE_MS accepted; 0 disables', () => {
+  assert.equal(parseIdleChromeMs({}), 900_000);
+  assert.equal(parseIdleChromeMs({ IDLE_CHROME_MS: '0' }), 0);
+  assert.equal(parseIdleChromeMs({ IDLE_CHROME_MS: '120000' }), 120_000);
+  assert.equal(parseIdleChromeMs({ BROWSER_IDLE_MS: '60000' }), 60_000);
+  assert.equal(parseIdleChromeMs({ IDLE_CHROME_MS: 'bogus' }), 900_000);
   assert.equal(parseMaxHotBrowsers({}), 1);
   assert.equal(parseMaxHotBrowsers({ MAX_HOT_BROWSERS: '2' }), 2);
   assert.equal(parseMaxHotBrowsers({ MAX_HOT_BROWSERS: '0' }), 1);
@@ -39,33 +42,33 @@ test('idle close only when warm ready browser exceeds timeout', () => {
   assert.equal(
     shouldIdleCloseBrowser({
       policy: 'idle',
-      idleMs: 60_000,
+      idleChromeMs: 60_000,
       now,
-      lastActivityAt: now - 61_000,
+      lastRpcAt: now - 61_000,
       phase: 'ready',
-      browserOpen: true,
+      chromeAlive: true,
     }).shouldClose,
     true,
   );
   assert.equal(
     shouldIdleCloseBrowser({
       policy: 'always',
-      idleMs: 1,
+      idleChromeMs: 1,
       now,
-      lastActivityAt: now - 999_999,
+      lastRpcAt: now - 999_999,
       phase: 'ready',
-      browserOpen: true,
+      chromeAlive: true,
     }).shouldClose,
     false,
   );
   assert.equal(
     shouldIdleCloseBrowser({
       policy: 'idle',
-      idleMs: 60_000,
+      idleChromeMs: 60_000,
       now,
-      lastActivityAt: now - 61_000,
+      lastRpcAt: now - 61_000,
       phase: 'ready',
-      browserOpen: true,
+      chromeAlive: true,
       hasActiveBotCall: true,
     }).shouldClose,
     false,
@@ -73,45 +76,65 @@ test('idle close only when warm ready browser exceeds timeout', () => {
   assert.equal(
     shouldIdleCloseBrowser({
       policy: 'idle',
-      idleMs: 60_000,
+      idleChromeMs: 60_000,
       now,
-      lastActivityAt: now - 10_000,
+      lastRpcAt: now - 10_000,
       phase: 'ready',
-      browserOpen: true,
+      chromeAlive: true,
     }).shouldClose,
     false,
   );
   assert.equal(
     shouldIdleCloseBrowser({
       policy: 'idle',
-      idleMs: 60_000,
+      idleChromeMs: 60_000,
       now,
-      lastActivityAt: now - 61_000,
+      lastRpcAt: now - 61_000,
       phase: 'ready',
-      browserOpen: true,
+      chromeAlive: true,
       pausedByLock: true,
+    }).shouldClose,
+    false,
+  );
+  assert.equal(
+    shouldIdleCloseBrowser({
+      policy: 'idle',
+      idleChromeMs: 0,
+      now,
+      lastRpcAt: now - 999_999,
+      phase: 'ready',
+      chromeAlive: true,
     }).shouldClose,
     false,
   );
 });
 
-test('status process snapshot and socket-only methods', () => {
-  const snap = buildProcessStatus({
+test('status snapshot uses instaseal contract fields', () => {
+  const snap = buildBrowserLifecycleStatus({
     policy: 'idle',
-    idleMs: 600_000,
+    idleChromeMs: 900_000,
     now: 2_000_000,
-    lastActivityAt: 1_400_000,
-    browserOpen: false,
-    phase: 'idle_no_browser',
+    lastRpcAt: 1_400_000,
+    chromeAlive: false,
+    phase: 'idle_cold',
     nodeRssBytes: 50 * 1024 * 1024,
     canWake: true,
   });
-  assert.equal(snap.browserOpen, false);
+  assert.equal(snap.chromeAlive, false);
+  assert.equal(snap.chrome_alive, false);
+  assert.equal(snap.browserOpen, false); // legacy alias
   assert.equal(snap.canWake, true);
-  assert.equal(snap.idleForSec, 600);
+  assert.equal(snap.idleForMs, 600_000);
+  assert.equal(snap.idle_for_ms, 600_000);
+  assert.equal(snap.idleChromeMs, 900_000);
+  assert.equal(snap.browserPolicy, 'idle');
   assert.equal(snap.nodeRssMb, 50);
+  assert.ok(snap.lastRpcAt);
   assert.equal(methodNeedsBrowser('status'), false);
   assert.equal(methodNeedsBrowser('listChats'), true);
   assert.equal(methodNeedsBrowser('getSendOutcome'), false);
   assert.equal(methodNeedsBrowser('prepareSend'), true);
+  assert.equal(isIdleColdPhase('idle_cold'), true);
+  assert.equal(isIdleColdPhase('idle_no_browser'), true);
+  assert.equal(isIdleColdPhase('ready'), false);
 });

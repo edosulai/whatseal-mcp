@@ -21,9 +21,13 @@ Rules:
 
 ## Browser memory policy (built-in)
 
-- Default `BROWSER_POLICY=idle`, `BROWSER_IDLE_MS=600000` (10 minutes).
-- Node + Unix control socket stay up; Chrome is destroyed on idle and recreated on next WA RPC (`ensureReady`).
-- `on_demand` = no Chrome on boot; `always` = keep hot (not recommended multi-tool laptops).
-- Soft documentation cap: `MAX_HOT_BROWSERS=1` (one hot browser per tool install is the intended budget).
-- Status: `browserOpen`, `canWake`, `process.{policy,idleForSec,nodeRssMb}`.
-- Prefer this over caffeinate / prevent-sleep. Mirror the same env names in instaseal if porting.
+- Contract shared with instaseal (identical names):
+  - `BROWSER_POLICY=idle|on_demand|always` (default `idle`)
+  - `IDLE_CHROME_MS` default `900000` (15m); `0` = never idle-close
+  - Status: `chromeAlive`, `browserPolicy`, `idleChromeMs`, `idleForMs`, `lastRpcAt`
+  - Cold phase: `idle_cold` (legacy readers may still see aliases)
+- Node + Unix control socket stay up; Chrome is destroyed on idle and recreated on next WA RPC (`ensureBrowser` / `ensureReady`).
+- `paused_by_lock` always wins over `idle_cold`. No caffeinate / prevent-sleep.
+- Soft documentation cap: `MAX_HOT_BROWSERS=1`. Do not multi-profile one Chromium as the first step.
+- Health poll while warm: ~90s. Auto-accept / call-bot OFF by default. Stop unused accounts instead of leaving warm Chrome.
+- Legacy env alias still accepted: `BROWSER_IDLE_MS` → `IDLE_CHROME_MS`.
