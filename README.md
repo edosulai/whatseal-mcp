@@ -22,6 +22,11 @@ biometric approval.
   health polling and call automation, and stays nearly idle. It resumes only
   after unlock + lid open. Disable only if needed with `LOCK_POWER_GUARD=0`.
   No caffeinate / prevent-sleep keep-alives are used.
+- **Low-memory browser policy (default `idle`):** the Node control socket stays up,
+  but Chrome is closed after `BROWSER_IDLE_MS` without WhatsApp RPC (default 10
+  minutes). The next WA method cold-starts the browser. Use `BROWSER_POLICY=always`
+  only when you need zero wake latency; `on_demand` keeps Chrome closed until the
+  first WA RPC even after unlock. Soft cap docs: `MAX_HOT_BROWSERS=1`.
 - The control interface is a Unix-domain socket with mode `0600`; there is no
   TCP listener.
 - A sensitive, persistent WhatsApp browser profile lives under
@@ -53,6 +58,7 @@ biometric approval.
 | --- | --- |
 | `daemon.mjs` | Headless Chrome + WhatsApp client + private Unix socket |
 | `lib/lock-power-guard.mjs` | Built-in lock/clamshell power policy (bag-safe default) |
+| `lib/browser-lifecycle.mjs` | Idle / on-demand browser policy helpers |
 | `mcp-server.mjs` | Agent tools over MCP stdio |
 | `cli.mjs` | Local diagnostic and emergency command-line interface |
 | `install-launchagent.sh` | Idempotent macOS LaunchAgent lifecycle |
@@ -179,7 +185,7 @@ and evolving surface, so verify this behavior after dependency or WhatsApp updat
 Every script supports `--verbose` / `-v`.
 
 - Status: `./install-launchagent.sh status`
-- Live status (includes `paused_by_lock` / `lockPower`): `node cli.mjs status --account alpha`
+- Live status (includes `paused_by_lock` / `lockPower` / `browserOpen` / `process`): `node cli.mjs status --account alpha`
 - Version report: `node cli.mjs compatibility`
 - Content-free upgrade test: `node cli.mjs compatibility-self-test`
 - Approve a reviewed machine-local tuple: `node approve-baseline.mjs --approve-current`
@@ -214,6 +220,31 @@ node cli.mjs status --account alpha   # expect reconnect/ready when unlocked
 Real-world check: lock the screen or close the lid, wait ~5–10s, confirm no
 WhatsApp Chrome processes and `paused_by_lock=true`; unlock/open lid and confirm
 resume without manual stop/start.
+
+### Browser memory policy (default idle)
+
+| Policy | Behavior |
+| --- | --- |
+| `idle` (default) | Warm-start Chrome after unlock; close it after `BROWSER_IDLE_MS` with no WA RPC; next RPC wakes |
+| `always` | Keep Chrome hot while unlocked (highest memory) |
+| `on_demand` | Do not open Chrome on boot/unlock; open only on first WA RPC |
+
+```bash
+# default install is already idle + 10 minutes
+./install-launchagent.sh install --account alpha
+
+# shorter idle for smoke tests
+BROWSER_IDLE_MS=60000 ./install-launchagent.sh install --account alpha
+node cli.mjs status --account alpha   # process.browserOpen / process.idleForSec
+
+# cold until first use
+BROWSER_POLICY=on_demand ./install-launchagent.sh install --account alpha
+```
+
+Status fields: `browserOpen`, `browserPolicy`, `canWake`, `process`
+(`nodeRssMb`, `idleForSec`, `lastActivityAt`). Call automation only works while
+Chrome is open; with `idle`/`on_demand`, missed ringing during cold periods is
+expected.
 
 All dependency installs use `npm ci --ignore-scripts` against the committed
 lockfile. There is no automatic dependency update. Runtime or lockfile drift

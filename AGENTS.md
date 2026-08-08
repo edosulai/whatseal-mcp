@@ -18,3 +18,12 @@ Rules:
 - On unlock + lid open: resume only if this guard paused the backend.
 - No caffeinate / prevent-sleep. Do not add centralized lock guards in other repos for this tool.
 - Status: `node cli.mjs status` exposes `paused_by_lock` and `lockPower`.
+
+## Browser memory policy (built-in)
+
+- Default `BROWSER_POLICY=idle`, `BROWSER_IDLE_MS=600000` (10 minutes).
+- Node + Unix control socket stay up; Chrome is destroyed on idle and recreated on next WA RPC (`ensureReady`).
+- `on_demand` = no Chrome on boot; `always` = keep hot (not recommended multi-tool laptops).
+- Soft documentation cap: `MAX_HOT_BROWSERS=1` (one hot browser per tool install is the intended budget).
+- Status: `browserOpen`, `canWake`, `process.{policy,idleForSec,nodeRssMb}`.
+- Prefer this over caffeinate / prevent-sleep. Mirror the same env names in instaseal if porting.

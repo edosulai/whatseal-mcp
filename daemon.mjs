@@ -31,6 +31,15 @@ import {
   isLockPowerGuardEnabled,
   readPowerSessionState,
 } from './lib/lock-power-guard.mjs';
+import {
+  buildProcessStatus,
+  methodNeedsBrowser,
+  parseBrowserIdleMs,
+  parseBrowserPolicy,
+  parseMaxHotBrowsers,
+  shouldIdleCloseBrowser,
+  shouldStartBrowserOnBoot,
+} from './lib/browser-lifecycle.mjs';
 
 import {
   deepProbeVoipStack,
@@ -99,6 +108,7 @@ const runtimeSourceFiles = [
   'daemon.mjs',
   'lib/core.mjs',
   'lib/lock-power-guard.mjs',
+  'lib/browser-lifecycle.mjs',
   'lib/call-policy.mjs',
   'lib/call-audio.mjs',
   'lib/call-bridge.mjs',
@@ -131,6 +141,11 @@ const acknowledgementHistory = new Map();
 //   WHATSAPP_DEBUG=1               → show Chrome window for debugging only
 //
 // Chrome is ALWAYS headless unless WHATSAPP_DEBUG=1 is set.
+//
+// Browser memory policy (default: idle):
+//   BROWSER_POLICY=always|idle|on_demand
+//   BROWSER_IDLE_MS=600000          → close Chrome after N ms without WA RPC
+//   MAX_HOT_BROWSERS=1              → soft per-tool documentation cap
 //
 // Audio file:
 //   WHATSAPP_BOT_AUDIO=/abs/path.wav|m4a
@@ -223,6 +238,16 @@ const lockStateHelperPath = process.env.WHATSAPP_LOCK_STATE_HELPER
 let pausedByLock = false;
 let lockPowerGuard = null;
 let browserInitInFlight = null;
+// Idle / on-demand browser lifecycle: Node + socket stay up; Chrome is optional.
+const browserPolicy = parseBrowserPolicy(process.env);
+const browserIdleMs = parseBrowserIdleMs(process.env);
+const maxHotBrowsers = parseMaxHotBrowsers(process.env);
+let browserOpen = false;
+let lastActivityAt = Date.now();
+let idleTimer = null;
+let idleCloseInFlight = null;
+let clientGeneration = 0;
+let client = null;
 
 const syntheticDocument = Buffer.from([
   'WhatsApp Agent E2E Test Document',
@@ -242,63 +267,118 @@ const syntheticVCard = [
 
 const chromePath = process.env.WHATSAPP_CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const approvalHelper = process.env.WHATSAPP_APPROVAL_HELPER || `${paths.state}/native-approval`;
-const client = new Client({
-  authStrategy: new LocalAuth({ clientId: 'primary', dataPath: paths.auth }),
-  authTimeoutMs: 120000,
-  qrMaxRetries: 0,
-  bypassCSP: true,
-  puppeteer: {
-    // Headed mode when auto-accept is enabled: WhatsApp's call accept UI/WebRTC
-    // is more reliable with a real window than pure headless.
-    headless: voiceBotHeadless,
-    executablePath: chromePath,
-    pipe: true,
-    args: [
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-features=Translate,MediaRouter',
-      '--no-first-run',
-      '--no-default-browser-check',
-      // Call audio is scoped through the bridge's guarded WebAudio destination.
-      // Never install a process-wide fake capture device: unrelated calls must be untouched.
-      '--autoplay-policy=no-user-gesture-required',
-      '--window-size=1280,900',
-    ],
-    defaultViewport: { width: 1280, height: 900 },
-  },
-});
 
-// WhatsApp Web can emit several hasSynced callbacks while its SPA is still
-// replacing the main frame. whatsapp-web.js then calls attachEventListeners()
-// concurrently, which races Puppeteer's Runtime.addBinding and can leave the
-// client authenticated but never ready. Coalesce concurrent calls and wait for
-// WhatsApp's own Stream model to exist before exposing any bindings.
-const originalAttachEventListeners = client.attachEventListeners.bind(client);
-let attachEventListenersInFlight = null;
-client.attachEventListeners = (...args) => {
-  if (attachEventListenersInFlight) {
-    log.debug('listener-attach-coalesced', 'reusing the active listener installation');
-    return attachEventListenersInFlight;
-  }
-  attachEventListenersInFlight = (async () => {
-    log.info('listener-attach-wait', 'waiting for the WhatsApp Stream model and stable document');
-    await client.pupPage.waitForFunction(
-      () => {
-        const stream = window.require?.('WAWebStreamModel')?.Stream;
-        return document.readyState === 'complete' && Boolean(stream);
-      },
-      { timeout: 60000 },
-    );
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-    log.info('listener-attach-start', 'installing WhatsApp event listeners');
-    const result = await originalAttachEventListeners(...args);
-    log.info('listener-attach-complete', 'WhatsApp event listeners installed');
-    return result;
-  })().finally(() => {
-    attachEventListenersInFlight = null;
+function createWhatsAppClient() {
+  const generation = ++clientGeneration;
+  const next = new Client({
+    authStrategy: new LocalAuth({ clientId: 'primary', dataPath: paths.auth }),
+    authTimeoutMs: 120000,
+    qrMaxRetries: 0,
+    bypassCSP: true,
+    puppeteer: {
+      // Headed only when WHATSAPP_DEBUG=1. Production stays headless.
+      headless: voiceBotHeadless,
+      executablePath: chromePath,
+      pipe: true,
+      args: [
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-features=Translate,MediaRouter',
+        '--no-first-run',
+        '--no-default-browser-check',
+        // Call audio is scoped through the bridge's guarded WebAudio destination.
+        // Never install a process-wide fake capture device: unrelated calls must be untouched.
+        '--autoplay-policy=no-user-gesture-required',
+        '--window-size=1280,900',
+      ],
+      defaultViewport: { width: 1280, height: 900 },
+    },
   });
-  return attachEventListenersInFlight;
-};
+
+  // WhatsApp Web can emit several hasSynced callbacks while its SPA is still
+  // replacing the main frame. Coalesce concurrent attachEventListeners() and wait
+  // for Stream before exposing bindings (avoids authenticated-but-never-ready).
+  const originalAttachEventListeners = next.attachEventListeners.bind(next);
+  let attachEventListenersInFlight = null;
+  next.attachEventListeners = (...args) => {
+    if (attachEventListenersInFlight) {
+      log.debug('listener-attach-coalesced', 'reusing the active listener installation');
+      return attachEventListenersInFlight;
+    }
+    attachEventListenersInFlight = (async () => {
+      log.info('listener-attach-wait', 'waiting for the WhatsApp Stream model and stable document');
+      await next.pupPage.waitForFunction(
+        () => {
+          const stream = window.require?.('WAWebStreamModel')?.Stream;
+          return document.readyState === 'complete' && Boolean(stream);
+        },
+        { timeout: 60000 },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      log.info('listener-attach-start', 'installing WhatsApp event listeners');
+      const result = await originalAttachEventListeners(...args);
+      log.info('listener-attach-complete', 'WhatsApp event listeners installed');
+      return result;
+    })().finally(() => {
+      attachEventListenersInFlight = null;
+    });
+    return attachEventListenersInFlight;
+  };
+
+  bindClientLifecycleEvents(next, generation);
+  return next;
+}
+
+function isBrowserSessionCurrent(generation) {
+  return generation === clientGeneration && client != null;
+}
+
+function touchActivity(at = Date.now()) {
+  lastActivityAt = Number(at) || Date.now();
+  scheduleIdleBrowserClose();
+}
+
+function clearIdleTimer() {
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+}
+
+function scheduleIdleBrowserClose() {
+  clearIdleTimer();
+  if (browserPolicy === 'always') return;
+  if (!Number.isFinite(browserIdleMs) || browserIdleMs <= 0) return;
+  if (pausedByLock || phase === 'paused_by_lock' || shuttingDown) return;
+  if (!browserOpen || phase !== 'ready') return;
+  idleTimer = setTimeout(() => {
+    void maybeIdleCloseBrowser();
+  }, browserIdleMs);
+  if (typeof idleTimer.unref === 'function') idleTimer.unref();
+}
+
+function processStatusSnapshot() {
+  let nodeRssBytes = null;
+  try {
+    nodeRssBytes = process.memoryUsage?.().rss ?? null;
+  } catch {
+    nodeRssBytes = null;
+  }
+  const canWake = !pausedByLock
+    && !shuttingDown
+    && (phase === 'idle_no_browser' || phase === 'starting' || (!browserOpen && phase !== 'auth-failure'));
+  return buildProcessStatus({
+    policy: browserPolicy,
+    idleMs: browserIdleMs,
+    now: Date.now(),
+    lastActivityAt,
+    browserOpen,
+    phase,
+    pausedByLock,
+    nodeRssBytes,
+    canWake: Boolean(canWake || (browserOpen && phase === 'ready')),
+  });
+}
 
 function lockPowerStatusSnapshot() {
   const guardStatus = lockPowerGuard?.getStatus?.() || {
@@ -328,10 +408,11 @@ function lockPowerStatusSnapshot() {
 
 async function publishState(extra = {}) {
   const lockPower = lockPowerStatusSnapshot();
+  const processStatus = processStatusSnapshot();
   stateWriteQueue = stateWriteQueue.catch(() => {}).then(() => writeJsonAtomic(paths.stateFile, {
       phase,
       connectionState,
-      ready: phase === 'ready' && !pausedByLock,
+      ready: phase === 'ready' && !pausedByLock && browserOpen,
       qrAvailable: phase === 'pairing' && !pausedByLock,
       qrPath: phase === 'pairing' && !pausedByLock ? paths.qrFile : null,
       qrUpdatedAt,
@@ -339,6 +420,13 @@ async function publishState(extra = {}) {
       pid: process.pid,
       pausedByLock,
       paused_by_lock: pausedByLock,
+      browserOpen,
+      browserPolicy,
+      browserIdleMs,
+      maxHotBrowsers,
+      canWake: processStatus.canWake,
+      lastActivityAt: processStatus.lastActivityAt,
+      process: processStatus,
       lockPower,
       updatedAt: new Date().toISOString(),
       ...extra,
@@ -355,11 +443,76 @@ function stopHotTimers() {
     clearTimeout(authenticatedRecoveryTimer);
     authenticatedRecoveryTimer = null;
   }
+  clearIdleTimer();
   authenticatedRecoveryInFlight = false;
   readyFinalizationInFlight = null;
   botCallInFlight = false;
   activeBotCall = null;
   automaticCallReservation = null;
+}
+
+async function destroyBrowserSession(reason = 'destroy') {
+  stopHotTimers();
+  const current = client;
+  browserOpen = false;
+  browserInitInFlight = null;
+  if (!current) return;
+  try {
+    await teardownBotCallMedia(current.pupPage).catch(() => {});
+  } catch {
+    // ignore
+  }
+  try {
+    if (current?.pupBrowser) await current.pupBrowser.close().catch(() => {});
+  } catch {
+    // ignore
+  }
+  try {
+    await current.destroy();
+  } catch (error) {
+    log.debug('browser-destroy-warning', `${reason}: ${truncateText(error?.message || String(error), 200)}`);
+  }
+  // Invalidate any late event handlers from the destroyed client generation.
+  clientGeneration += 1;
+  client = null;
+}
+
+async function maybeIdleCloseBrowser() {
+  if (idleCloseInFlight) return idleCloseInFlight;
+  idleCloseInFlight = (async () => {
+    const decision = shouldIdleCloseBrowser({
+      policy: browserPolicy,
+      idleMs: browserIdleMs,
+      now: Date.now(),
+      lastActivityAt,
+      phase,
+      pausedByLock,
+      browserOpen,
+      hasActiveBotCall: Boolean(activeBotCall || botCallInFlight),
+      sendApprovalInFlight,
+    });
+    if (!decision.shouldClose) {
+      if (decision.reason === 'still_warm') scheduleIdleBrowserClose();
+      return;
+    }
+    logJson('info', 'browser-idle-close-start', {
+      reason: decision.reason,
+      idleForMs: decision.idleForMs,
+      idleMs: decision.idleMs,
+      policy: browserPolicy,
+    });
+    phase = 'idle_no_browser';
+    connectionState = 'IDLE_NO_BROWSER';
+    await destroyBrowserSession('idle');
+    await publishState();
+    logJson('info', 'browser-idle-closed', {
+      note: 'Chrome stopped after idle; control socket remains; next WA RPC will wake',
+      canWake: true,
+    });
+  })().finally(() => {
+    idleCloseInFlight = null;
+  });
+  return idleCloseInFlight;
 }
 
 async function pauseHotPathForLock(state) {
@@ -374,22 +527,7 @@ async function pauseHotPathForLock(state) {
     lidClosed: Boolean(state?.lidClosed),
     phase,
   });
-  stopHotTimers();
-  try {
-    await teardownBotCallMedia(client.pupPage).catch(() => {});
-  } catch {
-    // ignore
-  }
-  try {
-    if (client?.pupBrowser) await client.pupBrowser.close().catch(() => {});
-  } catch {
-    // ignore
-  }
-  try {
-    await client.destroy();
-  } catch (error) {
-    log.debug('lock-power-destroy-warning', truncateText(error?.message || String(error), 200));
-  }
+  await destroyBrowserSession('lock-power');
   await publishState({
     pausedByLock: true,
     paused_by_lock: true,
@@ -1164,9 +1302,13 @@ async function installCallEndedBinding() {
 }
 
 async function finalizeReady(source) {
-  if (phase === 'ready') return;
+  if (phase === 'ready' && browserOpen && client) return;
   if (readyFinalizationInFlight) return await readyFinalizationInFlight;
   readyFinalizationInFlight = (async () => {
+    if (!client) throw new Error('No WhatsApp client is available to finalize ready.');
+    if (pausedByLock || phase === 'paused_by_lock' || shuttingDown) {
+      throw new Error('Cannot finalize ready while paused_by_lock/shutting down.');
+    }
     const state = await client.getState();
     if (state !== 'CONNECTED') throw new Error(`Operational state is ${state || 'unknown'}, not CONNECTED.`);
     const chats = await getChatSummaries();
@@ -1175,8 +1317,10 @@ async function finalizeReady(source) {
     if (authenticatedRecoveryTimer) clearTimeout(authenticatedRecoveryTimer);
     authenticatedRecoveryTimer = null;
     phase = 'ready';
+    browserOpen = true;
     readyAt = new Date().toISOString();
     connectionState = state;
+    touchActivity();
     await removeQr();
     await Promise.all([
       client.setAutoDownloadAudio(false),
@@ -1188,7 +1332,7 @@ async function finalizeReady(source) {
     await publishState();
     await writeCompatibilitySnapshot();
     log.info('ready', `source=${source} chatCount=${chats.length}`);
-// Install experimental call bridge on every ready path (library-event AND
+    // Install experimental call bridge on every ready path (library-event AND
     // operational-probe). Without this, operational-probe ready skips the
     // client.on('ready') handler and only installs on first accept attempt.
     try {
@@ -1219,6 +1363,16 @@ async function finalizeReady(source) {
     if (!healthTimer) {
       healthTimer = setInterval(async () => {
         try {
+          if (
+            pausedByLock
+            || phase === 'paused_by_lock'
+            || phase === 'idle_no_browser'
+            || shuttingDown
+            || !browserOpen
+            || !client
+          ) {
+            return;
+          }
           const current = await client.getState();
           connectionState = current;
           if (current !== 'CONNECTED') {
@@ -1228,12 +1382,22 @@ async function finalizeReady(source) {
           }
           await publishState();
         } catch (error) {
+          if (
+            pausedByLock
+            || phase === 'paused_by_lock'
+            || phase === 'idle_no_browser'
+            || shuttingDown
+            || !browserOpen
+          ) {
+            return;
+          }
           log.error('health-check-failed', truncateText(error?.message || String(error), 300));
           await shutdown('health-check', 1);
         }
       }, 30000);
       healthTimer.unref();
     }
+    scheduleIdleBrowserClose();
   })().finally(() => {
     readyFinalizationInFlight = null;
   });
@@ -1250,6 +1414,10 @@ function scheduleAuthenticatedRecovery(delayMs = 5000) {
 
 async function recoverAuthenticatedInitialization() {
   if (authenticatedRecoveryInFlight || phase !== 'authenticated') return;
+  // authenticated phase has a live Client before finalizeReady sets browserOpen.
+  if (!client || pausedByLock || phase === 'paused_by_lock' || shuttingDown) {
+    return;
+  }
   if (authenticatedRecoveryAttempts >= 3) {
     log.error('authenticated-recovery-exhausted', 'listener initialization did not complete after three attempts');
     return;
@@ -1259,6 +1427,7 @@ async function recoverAuthenticatedInitialization() {
   const attempt = authenticatedRecoveryAttempts;
   log.info('authenticated-recovery-start', `attempt=${attempt}/3`);
   try {
+    if (!client?.pupPage) throw new Error('No active puppeteer page for authenticated recovery');
     await client.pupPage.waitForFunction(
       () => {
         const socket = window.require?.('WAWebSocketModel')?.Socket;
@@ -1295,7 +1464,45 @@ async function ensureReady() {
   if (pausedByLock || phase === 'paused_by_lock') {
     throw new Error('WhatsApp backend is paused_by_lock (screen locked or lid closed). Unlock/open lid to resume.');
   }
-  if (phase !== 'ready') {
+  touchActivity();
+  if (phase === 'ready' && browserOpen && client) return;
+
+  // Idle / on-demand: cold-start Chrome on first method that needs WhatsApp.
+  if (
+    phase === 'idle_no_browser'
+    || phase === 'starting'
+    || phase === 'resuming_after_lock'
+    || (!browserOpen && phase !== 'pairing' && phase !== 'authenticated' && phase !== 'auth-failure')
+  ) {
+    logJson('info', 'browser-wake-start', { phase, policy: browserPolicy });
+    phase = 'starting';
+    await publishState();
+    await initializeBrowserSession();
+    // Wait until ready (or pairing/auth failure) after initialize.
+    const deadline = Date.now() + 180_000;
+    while (Date.now() < deadline) {
+      if (pausedByLock || phase === 'paused_by_lock') {
+        throw new Error('WhatsApp backend is paused_by_lock (screen locked or lid closed). Unlock/open lid to resume.');
+      }
+      if (phase === 'ready' && browserOpen && client) {
+        touchActivity();
+        return;
+      }
+      if (phase === 'pairing') {
+        throw new Error('WhatsApp backend needs pairing. Scan the QR via whatsapp_qr / status.qrPath.');
+      }
+      if (phase === 'auth-failure') {
+        throw new Error('WhatsApp authentication failed. Re-pair the linked device.');
+      }
+      if (phase === 'failed' || phase === 'disconnected') {
+        throw new Error(`WhatsApp backend is not ready (phase=${phase}).`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    throw new Error(`WhatsApp backend wake timed out (phase=${phase}).`);
+  }
+
+  if (phase !== 'ready' || !browserOpen || !client) {
     throw new Error(`WhatsApp backend is not ready (phase=${phase}). Pair the linked device first.`);
   }
 }
@@ -1442,9 +1649,10 @@ async function executeApprovedAction(draft) {
 async function dispatch(method, params = {}) {
   if (method === 'status') {
     const lockPower = lockPowerStatusSnapshot();
+    const processStatus = processStatusSnapshot();
     return {
       phase,
-      ready: phase === 'ready' && !pausedByLock,
+      ready: phase === 'ready' && !pausedByLock && browserOpen,
       connectionState,
       qrAvailable: phase === 'pairing' && !pausedByLock,
       qrPath: phase === 'pairing' && !pausedByLock ? paths.qrFile : null,
@@ -1453,6 +1661,13 @@ async function dispatch(method, params = {}) {
       pid: process.pid,
       pausedByLock,
       paused_by_lock: pausedByLock,
+      browserOpen,
+      browserPolicy,
+      browserIdleMs,
+      maxHotBrowsers,
+      canWake: processStatus.canWake,
+      lastActivityAt: processStatus.lastActivityAt,
+      process: processStatus,
       lockPower,
     };
   }
@@ -1506,6 +1721,20 @@ async function dispatch(method, params = {}) {
     };
   }
 
+
+  // Browser-backed experimental call helpers + chat lock unlock need a live session.
+  if ([
+    'deepProbeVoipStack',
+    'probeCallBridge',
+    'rejectCall',
+    'exploreCallApi',
+    'acceptCall',
+    'hangupCall',
+    'unlockChatLock',
+  ].includes(method)) {
+    touchActivity();
+    await ensureReady();
+  }
 
   if (method === 'deepProbeVoipStack') {
     try {
@@ -1657,6 +1886,12 @@ async function dispatch(method, params = {}) {
     }
   }
 
+  if (methodNeedsBrowser(method)) {
+    // Touch activity and wake Chrome for methods that need WhatsApp Web.
+    touchActivity();
+    await ensureReady();
+  }
+
   if (method === 'clearSearch') {
     try {
       const result = await clearWhatsAppSearchBox();
@@ -1665,8 +1900,6 @@ async function dispatch(method, params = {}) {
       return { success: false, error: err.message };
     }
   }
-
-  await ensureReady();
 
   if (method === 'listChats') {
     const limit = Math.min(Math.max(Number(params.limit || 50), 1), 200);
@@ -1924,86 +2157,248 @@ async function handleConnection(socket) {
   });
 }
 
-client.on('qr', async (qr) => {
-  const generation = ++qrGeneration;
-  try {
-    phase = 'pairing';
-    qrUpdatedAt = new Date().toISOString();
-    const image = await QRCode.toBuffer(qr, { width: 640, margin: 2, errorCorrectionLevel: 'M' });
-    if (generation !== qrGeneration || phase !== 'pairing') return;
-    await writeFileAtomic(paths.qrFile, image, 0o600);
-    await publishState();
-    log.info('pairing-qr-ready', `path=${paths.qrFile}`);
-  } catch (error) {
-    log.error('pairing-qr-failed', error.message);
-  }
-});
+function bindClientLifecycleEvents(session, generation) {
+  session.on('qr', async (qr) => {
+    if (!isBrowserSessionCurrent(generation)) return;
+    if (pausedByLock || phase === 'paused_by_lock' || shuttingDown) return;
+    const qrGen = ++qrGeneration;
+    try {
+      phase = 'pairing';
+      qrUpdatedAt = new Date().toISOString();
+      const image = await QRCode.toBuffer(qr, { width: 640, margin: 2, errorCorrectionLevel: 'M' });
+      if (!isBrowserSessionCurrent(generation) || qrGen !== qrGeneration || phase !== 'pairing') return;
+      await writeFileAtomic(paths.qrFile, image, 0o600);
+      await publishState();
+      log.info('pairing-qr-ready', `path=${paths.qrFile}`);
+    } catch (error) {
+      if (!isBrowserSessionCurrent(generation)) return;
+      log.error('pairing-qr-failed', error.message);
+    }
+  });
 
-client.on('authenticated', async () => {
-  qrGeneration += 1;
-  phase = 'authenticated';
-  await removeQr();
-  await publishState();
-  log.info('authenticated', 'linked-device credentials accepted');
-  scheduleAuthenticatedRecovery();
-});
-
-client.on('ready', async () => {
-  try {
-    // Grant notification permission without clicking broad WhatsApp UI controls.
-    const permission = await ensureDesktopNotificationPermission();
-    logJson('info', 'ready-enable-notifications', { permission });
-
-    // Call bridge install lives in finalizeReady so operational-probe ready
-    // (the common path) also gets the VoIP helpers + activeCall listener.
-    await finalizeReady('library-event');
-  } catch (error) {
-    log.error('ready-finalization-failed', truncateText(error?.message || String(error), 300));
+  session.on('authenticated', async () => {
+    if (!isBrowserSessionCurrent(generation)) return;
+    if (pausedByLock || phase === 'paused_by_lock' || shuttingDown) return;
+    qrGeneration += 1;
     phase = 'authenticated';
+    await removeQr();
     await publishState();
+    log.info('authenticated', 'linked-device credentials accepted');
     scheduleAuthenticatedRecovery();
-  }
-});
+  });
 
-client.on('message_ack', (message, ack) => {
-  const messageId = message?.id?._serialized || '';
-  rememberAcknowledgement(messageId, ack);
-  log.debug('message-ack', `messageId=${messageId || 'unknown'} ack=${Number(ack)} label=${ackLabel(Number(ack))}`);
-});
+  session.on('ready', async () => {
+    if (!isBrowserSessionCurrent(generation)) return;
+    if (pausedByLock || phase === 'paused_by_lock' || shuttingDown) return;
+    try {
+      // Grant notification permission without clicking broad WhatsApp UI controls.
+      const permission = await ensureDesktopNotificationPermission();
+      if (!isBrowserSessionCurrent(generation)) return;
+      logJson('info', 'ready-enable-notifications', { permission });
 
-client.on('auth_failure', async (message) => {
-  if (pausedByLock || phase === 'paused_by_lock' || shuttingDown) {
-    log.info('auth-failure-ignored-during-lock-pause', truncateText(message, 200));
+      // Call bridge install lives in finalizeReady so operational-probe ready
+      // (the common path) also gets the VoIP helpers + activeCall listener.
+      await finalizeReady('library-event');
+    } catch (error) {
+      if (!isBrowserSessionCurrent(generation) || pausedByLock || phase === 'paused_by_lock' || shuttingDown) return;
+      log.error('ready-finalization-failed', truncateText(error?.message || String(error), 300));
+      phase = 'authenticated';
+      await publishState();
+      scheduleAuthenticatedRecovery();
+    }
+  });
+
+  session.on('message_ack', (message, ack) => {
+    if (!isBrowserSessionCurrent(generation)) return;
+    const messageId = message?.id?._serialized || '';
+    rememberAcknowledgement(messageId, ack);
+    log.debug('message-ack', `messageId=${messageId || 'unknown'} ack=${Number(ack)} label=${ackLabel(Number(ack))}`);
+  });
+
+  session.on('auth_failure', async (message) => {
+    if (!isBrowserSessionCurrent(generation)) return;
+    if (
+      pausedByLock
+      || phase === 'paused_by_lock'
+      || phase === 'idle_no_browser'
+      || shuttingDown
+      || !browserOpen
+    ) {
+      log.info('auth-failure-ignored-during-intentional-teardown', truncateText(message, 200));
+      return;
+    }
+    qrGeneration += 1;
+    phase = 'auth-failure';
+    await removeQr();
+    await publishState({ error: truncateText(message, 300) });
+    log.error('auth-failure', truncateText(message, 300));
+  });
+
+  session.on('change_state', async (state) => {
+    if (!isBrowserSessionCurrent(generation)) return;
+    if (pausedByLock || phase === 'paused_by_lock' || phase === 'idle_no_browser' || !browserOpen) return;
+    connectionState = state;
+    await publishState();
+    log.debug('connection-state', state);
+  });
+
+  session.on('disconnected', async (reason) => {
+    if (!isBrowserSessionCurrent(generation)) {
+      log.info('disconnected-ignored-stale-generation', String(reason));
+      return;
+    }
+    // Intentional client.destroy() during bag-safe pause / idle close must not KeepAlive-loop.
+    if (
+      pausedByLock
+      || phase === 'paused_by_lock'
+      || phase === 'idle_no_browser'
+      || shuttingDown
+      || !browserOpen
+    ) {
+      log.info('disconnected-ignored-during-intentional-teardown', String(reason));
+      return;
+    }
+    phase = 'disconnected';
+    connectionState = String(reason);
+    qrGeneration += 1;
+    await removeQr();
+    await publishState();
+    log.error('disconnected', String(reason));
+    await shutdown('disconnected', 1);
+  });
+
+  session.on('call', async (call) => {
+    if (!isBrowserSessionCurrent(generation)) return;
+    if (pausedByLock || phase === 'paused_by_lock' || phase === 'idle_no_browser' || !browserOpen || shuttingDown) {
+      logJson('info', 'incoming-call-ignored-browser-unavailable', {
+        id: typeof call.id === 'string' ? call.id : null,
+        from: serializePeerJid(call.from),
+        phase,
+        browserOpen,
+      });
+      return;
+    }
+    await handleIncomingCallEvent(call);
+  });
+}
+
+async function handleIncomingCallEvent(call) {
+  const callId = typeof call.id === 'string' ? call.id : '';
+  const peerJid = serializePeerJid(call.from);
+  if (!callId) {
+    logJson('info', 'incoming-call-detect-only', { id: null, from: peerJid, policy: { allowed: false, reason: 'missing-call-id' } });
     return;
   }
-  qrGeneration += 1;
-  phase = 'auth-failure';
-  await removeQr();
-  await publishState({ error: truncateText(message, 300) });
-  log.error('auth-failure', truncateText(message, 300));
-});
-
-client.on('change_state', async (state) => {
-  if (pausedByLock || phase === 'paused_by_lock') return;
-  connectionState = state;
-  await publishState();
-  log.debug('connection-state', state);
-});
-
-client.on('disconnected', async (reason) => {
-  // Intentional client.destroy() during bag-safe pause must not KeepAlive-loop.
-  if (pausedByLock || phase === 'paused_by_lock' || shuttingDown) {
-    log.info('disconnected-ignored-during-lock-pause', String(reason));
+  const duplicate = Boolean(getCallAutomationState(callId, peerJid));
+  if (duplicate) {
+    logJson('info', 'incoming-call-duplicate-ignored', {
+      id: callId,
+      from: peerJid,
+      automation: getCallAutomationState(callId, peerJid),
+    });
     return;
   }
-  phase = 'disconnected';
-  connectionState = String(reason);
-  qrGeneration += 1;
-  await removeQr();
-  await publishState();
-  log.error('disconnected', String(reason));
-  await shutdown('disconnected', 1);
-});
+  rememberCallAutomationState(callId, 'resolving', null, peerJid);
+
+  lastCall = {
+    id: callId,
+    from: peerJid,
+    fromMe: Boolean(call.fromMe),
+    isVideo: Boolean(call.isVideo),
+    isGroup: Boolean(call.isGroup),
+    canHandleLocally: call.canHandleLocally,
+    webClientShouldHandle: call.webClientShouldHandle,
+    timestamp: new Date().toISOString(),
+    // Keep library reject helper for later use.
+    reject: typeof call.reject === 'function' ? call.reject.bind(call) : null,
+  };
+  const detectedCall = lastCall;
+  logJson('info', 'incoming-call', {
+    id: lastCall.id,
+    from: lastCall.from,
+    isVideo: lastCall.isVideo,
+    isGroup: lastCall.isGroup,
+    fromMe: lastCall.fromMe,
+    canHandleLocally: lastCall.canHandleLocally,
+    webClientShouldHandle: lastCall.webClientShouldHandle,
+    autoAcceptCalls,
+    allowlistValid: autoAcceptCallerConfig.valid,
+    allowlistCount: allowedCallerPhones.size,
+    botAudioReady,
+    headless: voiceBotHeadless,
+  });
+
+  const preliminary = evaluateAutoAcceptCallPolicy({
+    autoAcceptEnabled: autoAcceptCalls,
+    allowlistValid: autoAcceptCallerConfig.valid,
+    allowedCallers: allowedCallerPhones,
+    fromMe: lastCall.fromMe,
+    isGroup: lastCall.isGroup,
+    isVideo: lastCall.isVideo,
+    audioRequired: botAudioInject,
+    audioReady: botAudioReady,
+    callAlreadyActive: isOtherAutomaticCallActive(callId, peerJid),
+    skipIdentity: true,
+    peerJid,
+  });
+  if (!preliminary.allowed) {
+    detectedCall.automationPolicy = preliminary;
+    rememberCallAutomationState(callId, 'denied', preliminary.reason, peerJid);
+    logJson('info', 'incoming-call-detect-only', { id: callId, from: peerJid, policy: preliminary });
+    return;
+  }
+  automaticCallReservation = { id: callId, peerJid };
+
+  const callerIdentity = await resolveCallPeerIdentity(peerJid);
+  const policy = evaluateAutoAcceptCallPolicy({
+    autoAcceptEnabled: autoAcceptCalls,
+    allowlistValid: autoAcceptCallerConfig.valid,
+    allowedCallers: allowedCallerPhones,
+    fromMe: detectedCall.fromMe,
+    isGroup: detectedCall.isGroup,
+    isVideo: detectedCall.isVideo,
+    audioRequired: botAudioInject,
+    audioReady: botAudioReady,
+    callAlreadyActive: automaticCallReservation?.id !== callId
+      || automaticCallReservation.peerJid !== peerJid
+      || isOtherAutomaticCallActive(callId, peerJid),
+    peerJid,
+    resolvedPhone: callerIdentity.phone || null,
+  });
+  detectedCall.callerIdentity = callerIdentity;
+  detectedCall.automationPolicy = policy;
+  if (lastCall?.id === callId && lastCall.from === peerJid) {
+    lastCall.callerIdentity = callerIdentity;
+    lastCall.automationPolicy = policy;
+  }
+  logJson('info', 'incoming-call-policy', {
+    id: callId,
+    from: peerJid,
+    callerIdentity,
+    policy,
+  });
+  if (!policy.allowed) {
+    if (automaticCallReservation?.id === callId && automaticCallReservation.peerJid === peerJid) automaticCallReservation = null;
+    rememberCallAutomationState(callId, 'denied', policy.reason, peerJid);
+    return;
+  }
+
+  rememberCallAutomationState(callId, 'accepting', policy.reason, peerJid);
+  // Fire-and-forget so the event handler doesn't block other call updates.
+  // inject/hangup follow WHATSAPP_BOT_AUDIO_INJECT + WHATSAPP_BOT_HANGUP_AFTER_AUDIO.
+  void acceptIncomingCall(detectedCall, {
+    hangupAfterAudio: botHangupAfterAudio,
+    injectAudio: botAudioInject,
+    automatic: true,
+  }).then((result) => {
+    rememberCallAutomationState(callId, result?.success ? 'active' : 'failed', result?.error || null, peerJid);
+    if (!result?.success && automaticCallReservation?.id === callId && automaticCallReservation.peerJid === peerJid) automaticCallReservation = null;
+  }).catch((error) => {
+    if (automaticCallReservation?.id === callId && automaticCallReservation.peerJid === peerJid) automaticCallReservation = null;
+    rememberCallAutomationState(callId, 'failed', error.message, peerJid);
+    logJson('error', 'incoming-call-automation-failed', { id: callId, error: error.message });
+  });
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -3256,130 +3651,6 @@ async function acceptIncomingCall(callInfo, {
   }
 }
 
-client.on('call', async (call) => {
-  if (pausedByLock || phase === 'paused_by_lock') {
-    logJson('info', 'incoming-call-ignored-paused-by-lock', {
-      id: typeof call.id === 'string' ? call.id : null,
-      from: serializePeerJid(call.from),
-    });
-    return;
-  }
-  const callId = typeof call.id === 'string' ? call.id : '';
-  const peerJid = serializePeerJid(call.from);
-  if (!callId) {
-    logJson('info', 'incoming-call-detect-only', { id: null, from: peerJid, policy: { allowed: false, reason: 'missing-call-id' } });
-    return;
-  }
-  const duplicate = Boolean(getCallAutomationState(callId, peerJid));
-  if (duplicate) {
-    logJson('info', 'incoming-call-duplicate-ignored', {
-      id: callId,
-      from: peerJid,
-      automation: getCallAutomationState(callId, peerJid),
-    });
-    return;
-  }
-  rememberCallAutomationState(callId, 'resolving', null, peerJid);
-
-  lastCall = {
-    id: callId,
-    from: peerJid,
-    fromMe: Boolean(call.fromMe),
-    isVideo: Boolean(call.isVideo),
-    isGroup: Boolean(call.isGroup),
-    canHandleLocally: call.canHandleLocally,
-    webClientShouldHandle: call.webClientShouldHandle,
-    timestamp: new Date().toISOString(),
-    // Keep library reject helper for later use.
-    reject: typeof call.reject === 'function' ? call.reject.bind(call) : null,
-  };
-  const detectedCall = lastCall;
-  logJson('info', 'incoming-call', {
-    id: lastCall.id,
-    from: lastCall.from,
-    isVideo: lastCall.isVideo,
-    isGroup: lastCall.isGroup,
-    fromMe: lastCall.fromMe,
-    canHandleLocally: lastCall.canHandleLocally,
-    webClientShouldHandle: lastCall.webClientShouldHandle,
-    autoAcceptCalls,
-    allowlistValid: autoAcceptCallerConfig.valid,
-    allowlistCount: allowedCallerPhones.size,
-    botAudioReady,
-    headless: voiceBotHeadless,
-  });
-
-  const preliminary = evaluateAutoAcceptCallPolicy({
-    autoAcceptEnabled: autoAcceptCalls,
-    allowlistValid: autoAcceptCallerConfig.valid,
-    allowedCallers: allowedCallerPhones,
-    fromMe: lastCall.fromMe,
-    isGroup: lastCall.isGroup,
-    isVideo: lastCall.isVideo,
-    audioRequired: botAudioInject,
-    audioReady: botAudioReady,
-    callAlreadyActive: isOtherAutomaticCallActive(callId, peerJid),
-    skipIdentity: true,
-    peerJid,
-  });
-  if (!preliminary.allowed) {
-    detectedCall.automationPolicy = preliminary;
-    rememberCallAutomationState(callId, 'denied', preliminary.reason, peerJid);
-    logJson('info', 'incoming-call-detect-only', { id: callId, from: peerJid, policy: preliminary });
-    return;
-  }
-  automaticCallReservation = { id: callId, peerJid };
-
-  const callerIdentity = await resolveCallPeerIdentity(peerJid);
-  const policy = evaluateAutoAcceptCallPolicy({
-    autoAcceptEnabled: autoAcceptCalls,
-    allowlistValid: autoAcceptCallerConfig.valid,
-    allowedCallers: allowedCallerPhones,
-    fromMe: detectedCall.fromMe,
-    isGroup: detectedCall.isGroup,
-    isVideo: detectedCall.isVideo,
-    audioRequired: botAudioInject,
-    audioReady: botAudioReady,
-    callAlreadyActive: automaticCallReservation?.id !== callId
-      || automaticCallReservation.peerJid !== peerJid
-      || isOtherAutomaticCallActive(callId, peerJid),
-    peerJid,
-    resolvedPhone: callerIdentity.phone || null,
-  });
-  detectedCall.callerIdentity = callerIdentity;
-  detectedCall.automationPolicy = policy;
-  if (lastCall?.id === callId && lastCall.from === peerJid) {
-    lastCall.callerIdentity = callerIdentity;
-    lastCall.automationPolicy = policy;
-  }
-  logJson('info', 'incoming-call-policy', {
-    id: callId,
-    from: peerJid,
-    callerIdentity,
-    policy,
-  });
-  if (!policy.allowed) {
-    if (automaticCallReservation?.id === callId && automaticCallReservation.peerJid === peerJid) automaticCallReservation = null;
-    rememberCallAutomationState(callId, 'denied', policy.reason, peerJid);
-    return;
-  }
-
-  rememberCallAutomationState(callId, 'accepting', policy.reason, peerJid);
-  // Fire-and-forget so the event handler doesn't block other call updates.
-  // inject/hangup follow WHATSAPP_BOT_AUDIO_INJECT + WHATSAPP_BOT_HANGUP_AFTER_AUDIO.
-  void acceptIncomingCall(detectedCall, {
-    hangupAfterAudio: botHangupAfterAudio,
-    injectAudio: botAudioInject,
-    automatic: true,
-  }).then((result) => {
-    rememberCallAutomationState(callId, result?.success ? 'active' : 'failed', result?.error || null, peerJid);
-    if (!result?.success && automaticCallReservation?.id === callId && automaticCallReservation.peerJid === peerJid) automaticCallReservation = null;
-  }).catch((error) => {
-    if (automaticCallReservation?.id === callId && automaticCallReservation.peerJid === peerJid) automaticCallReservation = null;
-    rememberCallAutomationState(callId, 'failed', error.message, peerJid);
-    logJson('error', 'incoming-call-automation-failed', { id: callId, error: error.message });
-  });
-});
 
 async function socketIsActive() {
   try {
@@ -3420,8 +3691,7 @@ async function shutdown(signal, exitCode = 0) {
     new Promise((resolve) => httpServer?.close(resolve) || resolve()),
     new Promise((resolve) => setTimeout(resolve, 2000)),
   ]);
-  await teardownBotCallMedia(client.pupPage).catch(() => {});
-  await client.destroy().catch(() => {});
+  await destroyBrowserSession('shutdown').catch(() => {});
   await rm(paths.socket, { force: true });
   await removeQr();
   log.info('shutdown-complete', `signal=${signal}`);
@@ -3433,8 +3703,18 @@ async function initializeBrowserSession() {
     log.info('browser-initialize-skipped', 'paused_by_lock_or_shutdown');
     return;
   }
+  if (phase === 'ready' && browserOpen && client) return;
   if (browserInitInFlight) return browserInitInFlight;
   browserInitInFlight = (async () => {
+    // Recreate Client after idle/lock destroy — re-initialize on a dead Client is unreliable.
+    if (!client) {
+      client = createWhatsAppClient();
+      logJson('info', 'browser-client-created', {
+        generation: clientGeneration,
+        policy: browserPolicy,
+        phase,
+      });
+    }
     log.info('browser-initialize', 'starting isolated headless Chrome');
     let heartbeat = 0;
     const heartbeatTimer = setInterval(() => {
@@ -3447,13 +3727,12 @@ async function initializeBrowserSession() {
         client.initialize(),
         new Promise((_, reject) => setTimeout(() => reject(new Error('WhatsApp initialization exceeded 180 seconds.')), 180000)),
       ]);
-      if (pausedByLock || shuttingDown) {
-        log.info('browser-initialize-aborted-after-lock', 'discarding session started before pause');
-        await teardownBotCallMedia(client.pupPage).catch(() => {});
-        await client.destroy().catch(() => {});
+      if (pausedByLock || shuttingDown || phase === 'idle_no_browser') {
+        log.info('browser-initialize-aborted-after-policy', 'discarding session started before pause/idle');
+        await destroyBrowserSession('init-aborted');
       }
     } catch (error) {
-      if (pausedByLock || shuttingDown) {
+      if (pausedByLock || shuttingDown || phase === 'idle_no_browser') {
         log.info('browser-initialize-cancelled', truncateText(error?.message || String(error), 200));
         return;
       }
@@ -3564,14 +3843,22 @@ async function main() {
   // GET /api/status
   app.get('/api/status', async (req, res) => {
     try {
+      const processStatus = processStatusSnapshot();
       res.json({
         ok: true,
         result: {
           phase,
-          ready: phase === 'ready' && !pausedByLock,
+          ready: phase === 'ready' && !pausedByLock && browserOpen,
           connectionState,
           pausedByLock,
           paused_by_lock: pausedByLock,
+          browserOpen,
+          browserPolicy,
+          browserIdleMs,
+          maxHotBrowsers,
+          canWake: processStatus.canWake,
+          lastActivityAt: processStatus.lastActivityAt,
+          process: processStatus,
           lockPower: lockPowerStatusSnapshot(),
         },
       });
@@ -3583,7 +3870,7 @@ async function main() {
   // GET /api/me - get current WhatsApp user info
   app.get('/api/me', async (req, res) => {
     try {
-      if (phase !== 'ready') return res.status(503).json({ error: 'WhatsApp not ready' });
+      await ensureReady();
       const info = client.info;
       res.json({
         ok: true,
@@ -3637,7 +3924,7 @@ async function main() {
   // GET /api/chats
   app.get('/api/chats', async (req, res) => {
     try {
-      if (phase !== 'ready') return res.status(503).json({ error: 'WhatsApp not ready' });
+      await ensureReady();
       const chats = await getChatSummaries({ includeLastMessage: true });
       const transformed = chats.map(chat => ({
         id: chat.id,
@@ -3659,7 +3946,7 @@ async function main() {
   // GET /api/messages/:chatId
   app.get('/api/messages/:chatId', async (req, res) => {
     try {
-      if (phase !== 'ready') return res.status(503).json({ error: 'WhatsApp not ready' });
+      await ensureReady();
       const { chatId } = req.params;
       const limit = Math.min(Number(req.query.limit) || 50, 100);
       const messages = await getMessagesDirect(chatId, limit);
@@ -3683,7 +3970,7 @@ async function main() {
   // GET /api/media/:messageId - serve media (stickers, images, etc)
   app.get('/api/media/:messageId', async (req, res) => {
     try {
-      if (phase !== 'ready') return res.status(503).json({ error: 'WhatsApp not ready' });
+      await ensureReady();
       const { messageId } = req.params;
       const decodedId = decodeURIComponent(messageId);
       log.info('media-request', `messageId=${decodedId}`);
@@ -3800,7 +4087,7 @@ async function main() {
   // POST /api/send - Direct send without fingerprint (Web UI only)
   app.post('/api/send', async (req, res) => {
     try {
-      if (phase !== 'ready') return res.status(503).json({ error: 'WhatsApp not ready' });
+      await ensureReady();
       const { chatId, text } = req.body;
       if (!chatId || !text) return res.status(400).json({ error: 'chatId and text required' });
       
@@ -3837,13 +4124,23 @@ async function main() {
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('uncaughtException', (error) => {
     log.error('uncaught-exception', error.stack || error.message);
-    // While bag-paused, swallow Chrome teardown races instead of crash-looping.
-    if (pausedByLock || phase === 'paused_by_lock') return;
+    // While bag-paused or intentional idle close, swallow Chrome teardown races.
+    if (
+      pausedByLock
+      || phase === 'paused_by_lock'
+      || phase === 'idle_no_browser'
+      || (!browserOpen && phase !== 'failed' && phase !== 'disconnected')
+    ) return;
     void shutdown('uncaughtException', 1);
   });
   process.on('unhandledRejection', (error) => {
     log.error('unhandled-rejection', error?.stack || error?.message || String(error));
-    if (pausedByLock || phase === 'paused_by_lock') return;
+    if (
+      pausedByLock
+      || phase === 'paused_by_lock'
+      || phase === 'idle_no_browser'
+      || (!browserOpen && phase !== 'failed' && phase !== 'disconnected')
+    ) return;
     void shutdown('unhandledRejection', 1);
   });
 
@@ -3870,9 +4167,28 @@ async function main() {
   });
   await lockPowerGuard.start();
 
+  logJson('info', 'browser-policy-config', {
+    policy: browserPolicy,
+    idleMs: browserIdleMs,
+    maxHotBrowsers,
+    startOnBoot: shouldStartBrowserOnBoot(browserPolicy),
+  });
+
   if (pausedByLock) {
     log.info('browser-initialize-deferred', 'screen locked or lid closed; Chrome will start after unlock');
     await publishState();
+    return;
+  }
+
+  if (!shouldStartBrowserOnBoot(browserPolicy)) {
+    phase = 'idle_no_browser';
+    connectionState = 'IDLE_NO_BROWSER';
+    browserOpen = false;
+    await publishState();
+    logJson('info', 'browser-on-demand-idle', {
+      note: 'Control socket up; Chrome starts on first WhatsApp RPC',
+      policy: browserPolicy,
+    });
     return;
   }
 

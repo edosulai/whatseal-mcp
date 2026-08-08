@@ -33,6 +33,11 @@ LOCK_POWER_GUARD="${LOCK_POWER_GUARD:-1}"
 LOCK_POWER_GUARD_INTERVAL_MS="${LOCK_POWER_GUARD_INTERVAL_MS:-5000}"
 # Optional smoke-test override: locked|unlocked. Leave empty in production installs.
 LOCK_POWER_GUARD_FORCE="${LOCK_POWER_GUARD_FORCE:-}"
+# Browser memory policy (default idle): keep control socket, close Chrome after inactivity.
+# always = Chrome always hot; idle = warm start then idle-close; on_demand = cold until first WA RPC.
+BROWSER_POLICY="${BROWSER_POLICY:-idle}"
+BROWSER_IDLE_MS="${BROWSER_IDLE_MS:-600000}"
+MAX_HOT_BROWSERS="${MAX_HOT_BROWSERS:-1}"
 
 log() { printf '%s script=whatsapp-launchagent pid=%s event=%s detail=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$1" "${2:-}"; }
 vlog() { [[ "$VERBOSE" -eq 1 ]] && log "debug" "$*" || true; }
@@ -150,7 +155,7 @@ show_status() {
   log "progress" "[1/3] 33% — checking private control socket"
   if [[ -S "$STATE_DIR/control.sock" ]]; then printf 'socket=present:%s\n' "$STATE_DIR/control.sock"; else printf 'socket=missing\n'; fi
   log "progress" "[2/3] 66% — checking backend state"
-  if [[ -f "$STATE_DIR/status.json" ]]; then run "$NODE_BIN" -e 'const fs=require("fs"); const p=process.argv[1]; const s=JSON.parse(fs.readFileSync(p)); console.log(`phase=${s.phase||"unknown"}`); console.log(`ready=${Boolean(s.ready)}`); console.log(`qrAvailable=${Boolean(s.qrAvailable)}`); console.log(`paused_by_lock=${Boolean(s.paused_by_lock||s.pausedByLock)}`); if(s.lockPower){console.log(`lock_power_enabled=${Boolean(s.lockPower.enabled)}`); if(s.lockPower.reason) console.log(`lock_power_reason=${s.lockPower.reason}`);} if(s.qrPath) console.log(`qrPath=${s.qrPath}`)' "$STATE_DIR/status.json"; else printf 'phase=unknown\n'; fi
+  if [[ -f "$STATE_DIR/status.json" ]]; then run "$NODE_BIN" -e 'const fs=require("fs"); const p=process.argv[1]; const s=JSON.parse(fs.readFileSync(p)); console.log(`phase=${s.phase||"unknown"}`); console.log(`ready=${Boolean(s.ready)}`); console.log(`qrAvailable=${Boolean(s.qrAvailable)}`); console.log(`paused_by_lock=${Boolean(s.paused_by_lock||s.pausedByLock)}`); console.log(`browserOpen=${Boolean(s.browserOpen)}`); console.log(`browserPolicy=${s.browserPolicy||s.process?.policy||"unknown"}`); console.log(`canWake=${Boolean(s.canWake||s.process?.canWake)}`); if(s.lockPower){console.log(`lock_power_enabled=${Boolean(s.lockPower.enabled)}`); if(s.lockPower.reason) console.log(`lock_power_reason=${s.lockPower.reason}`);} if(s.qrPath) console.log(`qrPath=${s.qrPath}`)' "$STATE_DIR/status.json"; else printf 'phase=unknown\n'; fi
   log "progress" "[3/3] 100% — status complete"
 }
 
@@ -225,6 +230,10 @@ ${account_args}
     <key>LOCK_POWER_GUARD</key><string>${LOCK_POWER_GUARD}</string>
     <key>LOCK_POWER_GUARD_INTERVAL_MS</key><string>${LOCK_POWER_GUARD_INTERVAL_MS}</string>
   ${force_entry}
+    <!-- Browser memory policy (default idle). always|idle|on_demand -->
+    <key>BROWSER_POLICY</key><string>${BROWSER_POLICY}</string>
+    <key>BROWSER_IDLE_MS</key><string>${BROWSER_IDLE_MS}</string>
+    <key>MAX_HOT_BROWSERS</key><string>${MAX_HOT_BROWSERS}</string>
   </dict>
   <key>Umask</key><integer>63</integer>
   <key>RunAtLoad</key><true/>
@@ -333,6 +342,20 @@ case "$ACTION" in
         *) fail "LOCK_POWER_GUARD_FORCE must be locked|unlocked (or empty)" ;;
       esac
     fi
+    case "$BROWSER_POLICY" in
+      always|idle|on_demand|on-demand|hot|cold|ondemand) ;;
+      *) fail "BROWSER_POLICY must be always|idle|on_demand" ;;
+    esac
+    # Normalize hyphenated form for the plist.
+    if [[ "$BROWSER_POLICY" == "on-demand" || "$BROWSER_POLICY" == "ondemand" || "$BROWSER_POLICY" == "cold" ]]; then
+      BROWSER_POLICY="on_demand"
+    elif [[ "$BROWSER_POLICY" == "hot" ]]; then
+      BROWSER_POLICY="always"
+    fi
+    [[ "$BROWSER_IDLE_MS" =~ ^[0-9]+$ ]] || fail "BROWSER_IDLE_MS must be a non-negative integer"
+    (( BROWSER_IDLE_MS <= 86400000 )) || fail "BROWSER_IDLE_MS must not exceed 86400000 (24h)"
+    [[ "$MAX_HOT_BROWSERS" =~ ^[0-9]+$ ]] || fail "MAX_HOT_BROWSERS must be a positive integer"
+    (( MAX_HOT_BROWSERS >= 1 && MAX_HOT_BROWSERS <= 8 )) || fail "MAX_HOT_BROWSERS must be between 1 and 8"
     if [[ -n "$VOICE_BOT_AUDIO" ]]; then
       [[ "$VOICE_BOT_AUDIO" == /* ]] || fail "WHATSAPP_BOT_AUDIO must be an absolute path"
       [[ -f "$VOICE_BOT_AUDIO" && ! -L "$VOICE_BOT_AUDIO" ]] || fail "WHATSAPP_BOT_AUDIO must be a regular non-symlink file"
