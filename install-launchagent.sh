@@ -16,6 +16,7 @@ MARKER="${STATE_DIR}/launchagent-owned"
 LOG_DIR="${STATE_DIR}/logs"
 APPROVAL_HELPER="${STATE_DIR}/native-approval"
 BASELINE_APPROVAL_HELPER="${STATE_DIR}/native-baseline-approval"
+LOCK_STATE_HELPER="${STATE_DIR}/native-lock-state"
 VERBOSE=0
 ACTION="install"
 ACCOUNT_ID=""
@@ -26,6 +27,12 @@ VOICE_BOT_AUDIO="${WHATSAPP_BOT_AUDIO:-}"
 VOICE_BOT_AUDIO_INJECT="${WHATSAPP_BOT_AUDIO_INJECT:-1}"
 VOICE_BOT_HANGUP_AFTER_AUDIO="${WHATSAPP_BOT_HANGUP_AFTER_AUDIO:-1}"
 VOICE_BOT_HANGUP_PADDING_MS="${WHATSAPP_BOT_HANGUP_PADDING_MS:-1500}"
+# Bag-safe by default: pause Chrome/hot work when screen is locked or lid is closed.
+# Set LOCK_POWER_GUARD=0 only if you intentionally want the daemon hot while locked.
+LOCK_POWER_GUARD="${LOCK_POWER_GUARD:-1}"
+LOCK_POWER_GUARD_INTERVAL_MS="${LOCK_POWER_GUARD_INTERVAL_MS:-5000}"
+# Optional smoke-test override: locked|unlocked. Leave empty in production installs.
+LOCK_POWER_GUARD_FORCE="${LOCK_POWER_GUARD_FORCE:-}"
 
 log() { printf '%s script=whatsapp-launchagent pid=%s event=%s detail=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$1" "${2:-}"; }
 vlog() { [[ "$VERBOSE" -eq 1 ]] && log "debug" "$*" || true; }
@@ -84,6 +91,7 @@ if [[ -n "$ACCOUNT_ID" ]]; then
   MARKER="${STATE_DIR}/launchagent-owned"
   APPROVAL_HELPER="${STATE_DIR}/native-approval"
   BASELINE_APPROVAL_HELPER="${STATE_DIR}/native-baseline-approval"
+  LOCK_STATE_HELPER="${STATE_DIR}/native-lock-state"
 fi
 [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || fail "LaunchAgent label may contain only letters, digits, dot, underscore, and hyphen"
 
@@ -142,7 +150,7 @@ show_status() {
   log "progress" "[1/3] 33% — checking private control socket"
   if [[ -S "$STATE_DIR/control.sock" ]]; then printf 'socket=present:%s\n' "$STATE_DIR/control.sock"; else printf 'socket=missing\n'; fi
   log "progress" "[2/3] 66% — checking backend state"
-  if [[ -f "$STATE_DIR/status.json" ]]; then run "$NODE_BIN" -e 'const fs=require("fs"); const p=process.argv[1]; const s=JSON.parse(fs.readFileSync(p)); console.log(`phase=${s.phase||"unknown"}`); console.log(`ready=${Boolean(s.ready)}`); console.log(`qrAvailable=${Boolean(s.qrAvailable)}`); if(s.qrPath) console.log(`qrPath=${s.qrPath}`)' "$STATE_DIR/status.json"; else printf 'phase=unknown\n'; fi
+  if [[ -f "$STATE_DIR/status.json" ]]; then run "$NODE_BIN" -e 'const fs=require("fs"); const p=process.argv[1]; const s=JSON.parse(fs.readFileSync(p)); console.log(`phase=${s.phase||"unknown"}`); console.log(`ready=${Boolean(s.ready)}`); console.log(`qrAvailable=${Boolean(s.qrAvailable)}`); console.log(`paused_by_lock=${Boolean(s.paused_by_lock||s.pausedByLock)}`); if(s.lockPower){console.log(`lock_power_enabled=${Boolean(s.lockPower.enabled)}`); if(s.lockPower.reason) console.log(`lock_power_reason=${s.lockPower.reason}`);} if(s.qrPath) console.log(`qrPath=${s.qrPath}`)' "$STATE_DIR/status.json"; else printf 'phase=unknown\n'; fi
   log "progress" "[3/3] 100% — status complete"
 }
 
@@ -151,7 +159,7 @@ render_plist() {
   chmod 700 "$STATE_DIR" "$LOG_DIR"
   local temporary="${PLIST}.$$.tmp"
   local escaped_label escaped_node escaped_daemon escaped_account account_args
-  local escaped_home escaped_base_state escaped_base_root escaped_chrome escaped_approval escaped_http_port
+  local escaped_home escaped_base_state escaped_base_root escaped_chrome escaped_approval escaped_lock_helper escaped_http_port
   local escaped_stdout escaped_stderr escaped_callers escaped_audio audio_entry
   escaped_label="$(xml_escape "$LABEL")"
   escaped_node="$(xml_escape "$NODE_BIN")"
@@ -162,6 +170,7 @@ render_plist() {
   escaped_base_root="$(xml_escape "$BASE_ROOT_DIR")"
   escaped_chrome="$(xml_escape "$CHROME_PATH")"
   escaped_approval="$(xml_escape "$APPROVAL_HELPER")"
+  escaped_lock_helper="$(xml_escape "$LOCK_STATE_HELPER")"
   escaped_http_port="$(xml_escape "$HTTP_PORT")"
   escaped_stdout="$(xml_escape "$LOG_DIR/stdout.log")"
   escaped_stderr="$(xml_escape "$LOG_DIR/stderr.log")"
@@ -175,6 +184,10 @@ render_plist() {
   audio_entry=""
   if [[ -n "$VOICE_BOT_AUDIO" ]]; then
     audio_entry="    <key>WHATSAPP_BOT_AUDIO</key><string>${escaped_audio}</string>"
+  fi
+  force_entry=""
+  if [[ -n "$LOCK_POWER_GUARD_FORCE" ]]; then
+    force_entry="    <key>LOCK_POWER_GUARD_FORCE</key><string>$(xml_escape "$LOCK_POWER_GUARD_FORCE")</string>"
   fi
   ( umask 077; cat >"$temporary" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -196,6 +209,7 @@ ${account_args}
     <key>WHATSAPP_AGENT_ROOT</key><string>${escaped_base_root}</string>
     <key>WHATSAPP_CHROME_PATH</key><string>${escaped_chrome}</string>
     <key>WHATSAPP_APPROVAL_HELPER</key><string>${escaped_approval}</string>
+    <key>WHATSAPP_LOCK_STATE_HELPER</key><string>${escaped_lock_helper}</string>
     <key>WHATSAPP_ACCOUNT_ID</key><string>${escaped_account}</string>
     <key>WHATSAPP_HTTP_PORT</key><string>${escaped_http_port}</string>
     <!-- Voice-bot defaults fail closed. Supply overrides only while rendering this private plist. -->
@@ -207,6 +221,10 @@ ${account_args}
     <key>WHATSAPP_BOT_AUDIO_INJECT</key><string>${VOICE_BOT_AUDIO_INJECT}</string>
     <key>WHATSAPP_BOT_HANGUP_AFTER_AUDIO</key><string>${VOICE_BOT_HANGUP_AFTER_AUDIO}</string>
     <key>WHATSAPP_BOT_HANGUP_PADDING_MS</key><string>${VOICE_BOT_HANGUP_PADDING_MS}</string>
+    <!-- Bag-safe power policy (default ON). Set LOCK_POWER_GUARD=0 to disable. -->
+    <key>LOCK_POWER_GUARD</key><string>${LOCK_POWER_GUARD}</string>
+    <key>LOCK_POWER_GUARD_INTERVAL_MS</key><string>${LOCK_POWER_GUARD_INTERVAL_MS}</string>
+  ${force_entry}
   </dict>
   <key>Umask</key><integer>63</integer>
   <key>RunAtLoad</key><true/>
@@ -304,8 +322,17 @@ case "$ACTION" in
     validate_boolean "WHATSAPP_AUTO_ACCEPT_CALLS" "$VOICE_AUTO_ACCEPT"
     validate_boolean "WHATSAPP_BOT_AUDIO_INJECT" "$VOICE_BOT_AUDIO_INJECT"
     validate_boolean "WHATSAPP_BOT_HANGUP_AFTER_AUDIO" "$VOICE_BOT_HANGUP_AFTER_AUDIO"
+    validate_boolean "LOCK_POWER_GUARD" "$LOCK_POWER_GUARD"
     [[ "$VOICE_BOT_HANGUP_PADDING_MS" =~ ^[0-9]+$ ]] || fail "WHATSAPP_BOT_HANGUP_PADDING_MS must be a non-negative integer"
     (( VOICE_BOT_HANGUP_PADDING_MS <= 60000 )) || fail "WHATSAPP_BOT_HANGUP_PADDING_MS must not exceed 60000"
+    [[ "$LOCK_POWER_GUARD_INTERVAL_MS" =~ ^[0-9]+$ ]] || fail "LOCK_POWER_GUARD_INTERVAL_MS must be a non-negative integer"
+    (( LOCK_POWER_GUARD_INTERVAL_MS >= 1000 && LOCK_POWER_GUARD_INTERVAL_MS <= 60000 )) || fail "LOCK_POWER_GUARD_INTERVAL_MS must be between 1000 and 60000"
+    if [[ -n "$LOCK_POWER_GUARD_FORCE" ]]; then
+      case "$LOCK_POWER_GUARD_FORCE" in
+        locked|unlocked|pause|resume|1|0) ;;
+        *) fail "LOCK_POWER_GUARD_FORCE must be locked|unlocked (or empty)" ;;
+      esac
+    fi
     if [[ -n "$VOICE_BOT_AUDIO" ]]; then
       [[ "$VOICE_BOT_AUDIO" == /* ]] || fail "WHATSAPP_BOT_AUDIO must be an absolute path"
       [[ -f "$VOICE_BOT_AUDIO" && ! -L "$VOICE_BOT_AUDIO" ]] || fail "WHATSAPP_BOT_AUDIO must be a regular non-symlink file"
@@ -314,27 +341,31 @@ case "$ACTION" in
     [[ -x "$CHROME_PATH" ]] || fail "Google Chrome is required at $CHROME_PATH"
     if is_loaded && { ! is_owned || ! loaded_is_owned; }; then fail "refusing to replace a loaded foreign LaunchAgent label: ${LABEL}"; fi
     if [[ -f "$PLIST" ]] && ! is_owned; then fail "refusing to overwrite foreign LaunchAgent: $PLIST"; fi
-    log "progress" "[0/7] 0% — validating the exact dependency lockfile"
+    log "progress" "[0/8] 0% — validating the exact dependency lockfile"
     run env PUPPETEER_SKIP_DOWNLOAD=true "$NPM_BIN" ci --prefix "$SCRIPT_DIR" --omit=dev --ignore-scripts --no-audit --no-fund --dry-run
-    log "progress" "[1/7] 14% — stopping the previous owned instance"
+    log "progress" "[1/8] 12% — stopping the previous owned instance"
     stop_agent
-    log "progress" "[2/7] 28% — installing the exact dependency lockfile"
+    log "progress" "[2/8] 25% — installing the exact dependency lockfile"
     install_dependencies_transactional || fail "exact dependency installation failed and previous dependencies were restored"
-    log "progress" "[3/7] 42% — compiling message Touch ID approval helper"
+    log "progress" "[3/8] 38% — compiling message Touch ID approval helper"
     mkdir -p "$STATE_DIR"
     chmod 700 "$STATE_DIR"
     run xcrun swiftc "$SCRIPT_DIR/native-approval.swift" -framework AppKit -framework LocalAuthentication -o "${APPROVAL_HELPER}.tmp"
     run chmod 500 "${APPROVAL_HELPER}.tmp"
     run /bin/mv -f "${APPROVAL_HELPER}.tmp" "$APPROVAL_HELPER"
-    log "progress" "[4/7] 57% — compiling baseline Touch ID approval helper"
+    log "progress" "[4/8] 50% — compiling baseline Touch ID approval helper"
     run xcrun swiftc "$SCRIPT_DIR/native-baseline-approval.swift" -framework AppKit -framework LocalAuthentication -o "${BASELINE_APPROVAL_HELPER}.tmp"
     run chmod 500 "${BASELINE_APPROVAL_HELPER}.tmp"
     run /bin/mv -f "${BASELINE_APPROVAL_HELPER}.tmp" "$BASELINE_APPROVAL_HELPER"
-    log "progress" "[5/7] 71% — rendering private LaunchAgent"
+    log "progress" "[5/8] 62% — compiling lock/clamshell state helper"
+    run xcrun swiftc "$SCRIPT_DIR/native-lock-state.swift" -framework CoreGraphics -o "${LOCK_STATE_HELPER}.tmp"
+    run chmod 500 "${LOCK_STATE_HELPER}.tmp"
+    run /bin/mv -f "${LOCK_STATE_HELPER}.tmp" "$LOCK_STATE_HELPER"
+    log "progress" "[6/8] 75% — rendering private LaunchAgent"
     render_plist
-    log "progress" "[6/7] 85% — starting headless backend"
+    log "progress" "[7/8] 88% — starting bag-safe headless backend"
     start_agent
-    log "progress" "[7/7] 100% — install complete"
+    log "progress" "[8/8] 100% — install complete"
     show_observability
     show_status
     ;;

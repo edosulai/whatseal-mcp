@@ -17,6 +17,11 @@ biometric approval.
   not expose the historical inbox of a personal WhatsApp account.
 - The browser runs headlessly with a dedicated `LocalAuth` directory. It never
   reuses the personal Chrome profile or the shared Playwright browser profile.
+- **Bag-safe by default:** when the screen is locked or the laptop lid is closed,
+  the daemon pauses the Chrome/WhatsApp hot path (`paused_by_lock=true`), stops
+  health polling and call automation, and stays nearly idle. It resumes only
+  after unlock + lid open. Disable only if needed with `LOCK_POWER_GUARD=0`.
+  No caffeinate / prevent-sleep keep-alives are used.
 - The control interface is a Unix-domain socket with mode `0600`; there is no
   TCP listener.
 - A sensitive, persistent WhatsApp browser profile lives under
@@ -47,10 +52,12 @@ biometric approval.
 | File | Purpose |
 | --- | --- |
 | `daemon.mjs` | Headless Chrome + WhatsApp client + private Unix socket |
+| `lib/lock-power-guard.mjs` | Built-in lock/clamshell power policy (bag-safe default) |
 | `mcp-server.mjs` | Agent tools over MCP stdio |
 | `cli.mjs` | Local diagnostic and emergency command-line interface |
 | `install-launchagent.sh` | Idempotent macOS LaunchAgent lifecycle |
 | `native-approval.swift` | Immutable native preview + macOS user authentication |
+| `native-lock-state.swift` | Lightweight CGSession screen-lock probe |
 | `tests/` | Non-networked safety and serialization tests |
 
 See [`RISK-CONTROLS.md`](./RISK-CONTROLS.md) for the threat model, compatibility
@@ -172,6 +179,7 @@ and evolving surface, so verify this behavior after dependency or WhatsApp updat
 Every script supports `--verbose` / `-v`.
 
 - Status: `./install-launchagent.sh status`
+- Live status (includes `paused_by_lock` / `lockPower`): `node cli.mjs status --account alpha`
 - Version report: `node cli.mjs compatibility`
 - Content-free upgrade test: `node cli.mjs compatibility-self-test`
 - Approve a reviewed machine-local tuple: `node approve-baseline.mjs --approve-current`
@@ -179,6 +187,33 @@ Every script supports `--verbose` / `-v`.
 - Stop: `./install-launchagent.sh stop`
 - Remove autostart: `./install-launchagent.sh remove`
 - Test: `npm run check`
+
+### Lock / clamshell power policy (default ON)
+
+Anyone who installs this tool gets bag-safe behavior automatically:
+
+| State | Behavior |
+| --- | --- |
+| Screen locked **or** lid closed | Destroy Chrome session, stop health/call hot work, set `paused_by_lock=true`, keep control socket for status |
+| Unlocked **and** lid open | Resume only if this guard paused the backend (clean LaunchAgent restart) |
+| `LOCK_POWER_GUARD=0` | Disable the policy (not recommended for laptops) |
+
+Manual smoke test without locking the Mac (re-render LaunchAgent env):
+
+```bash
+# force pause (simulate lock)
+LOCK_POWER_GUARD_FORCE=locked ./install-launchagent.sh install --account alpha
+node cli.mjs status --account alpha   # expect phase=paused_by_lock, paused_by_lock=true
+
+# clear force / normal bag-safe mode (auto-detect lock & lid)
+unset LOCK_POWER_GUARD_FORCE
+./install-launchagent.sh install --account alpha
+node cli.mjs status --account alpha   # expect reconnect/ready when unlocked
+```
+
+Real-world check: lock the screen or close the lid, wait ~5–10s, confirm no
+WhatsApp Chrome processes and `paused_by_lock=true`; unlock/open lid and confirm
+resume without manual stop/start.
 
 All dependency installs use `npm ci --ignore-scripts` against the committed
 lockfile. There is no automatic dependency update. Runtime or lockfile drift

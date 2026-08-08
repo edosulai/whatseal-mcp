@@ -26,6 +26,11 @@ import {
   writeFileAtomic,
   writeJsonAtomic,
 } from './lib/core.mjs';
+import {
+  createLockPowerGuard,
+  isLockPowerGuardEnabled,
+  readPowerSessionState,
+} from './lib/lock-power-guard.mjs';
 
 import {
   deepProbeVoipStack,
@@ -93,6 +98,7 @@ const sourceRoot = fileURLToPath(new URL('.', import.meta.url));
 const runtimeSourceFiles = [
   'daemon.mjs',
   'lib/core.mjs',
+  'lib/lock-power-guard.mjs',
   'lib/call-policy.mjs',
   'lib/call-audio.mjs',
   'lib/call-bridge.mjs',
@@ -102,6 +108,7 @@ const runtimeSourceFiles = [
   'approve-baseline.mjs',
   'native-approval.swift',
   'native-baseline-approval.swift',
+  'native-lock-state.swift',
   'install-launchagent.sh',
   'package.json',
 ];
@@ -208,6 +215,14 @@ let readyFinalizationInFlight = null;
 let healthTimer = null;
 let sendApprovalInFlight = false;
 let outcomeWriteQueue = Promise.resolve();
+// Built-in bag-safe power policy: pause Chrome/hot work on lock or lid close.
+// Default ON. Set LOCK_POWER_GUARD=0 to disable. Never uses caffeinate.
+const lockPowerGuardEnabled = isLockPowerGuardEnabled(process.env);
+const lockStateHelperPath = process.env.WHATSAPP_LOCK_STATE_HELPER
+  || `${paths.state}/native-lock-state`;
+let pausedByLock = false;
+let lockPowerGuard = null;
+let browserInitInFlight = null;
 
 const syntheticDocument = Buffer.from([
   'WhatsApp Agent E2E Test Document',
@@ -285,20 +300,128 @@ client.attachEventListeners = (...args) => {
   return attachEventListenersInFlight;
 };
 
+function lockPowerStatusSnapshot() {
+  const guardStatus = lockPowerGuard?.getStatus?.() || {
+    enabled: lockPowerGuardEnabled,
+    running: false,
+    pausedByLock,
+    paused_by_lock: pausedByLock,
+    screenLocked: false,
+    lidClosed: false,
+    shouldPause: false,
+    reason: null,
+  };
+  return {
+    enabled: Boolean(guardStatus.enabled),
+    running: Boolean(guardStatus.running),
+    pausedByLock: Boolean(pausedByLock || guardStatus.pausedByLock),
+    paused_by_lock: Boolean(pausedByLock || guardStatus.paused_by_lock),
+    screenLocked: Boolean(guardStatus.screenLocked),
+    lidClosed: Boolean(guardStatus.lidClosed),
+    shouldPause: Boolean(guardStatus.shouldPause),
+    reason: guardStatus.reason || null,
+    pausedAt: guardStatus.pausedAt || null,
+    lastTransitionAt: guardStatus.lastTransitionAt || null,
+    lastError: guardStatus.lastError || null,
+  };
+}
+
 async function publishState(extra = {}) {
+  const lockPower = lockPowerStatusSnapshot();
   stateWriteQueue = stateWriteQueue.catch(() => {}).then(() => writeJsonAtomic(paths.stateFile, {
       phase,
       connectionState,
-      ready: phase === 'ready',
-      qrAvailable: phase === 'pairing',
-      qrPath: phase === 'pairing' ? paths.qrFile : null,
+      ready: phase === 'ready' && !pausedByLock,
+      qrAvailable: phase === 'pairing' && !pausedByLock,
+      qrPath: phase === 'pairing' && !pausedByLock ? paths.qrFile : null,
       qrUpdatedAt,
       readyAt,
       pid: process.pid,
+      pausedByLock,
+      paused_by_lock: pausedByLock,
+      lockPower,
       updatedAt: new Date().toISOString(),
       ...extra,
     }));
   await stateWriteQueue;
+}
+
+function stopHotTimers() {
+  if (healthTimer) {
+    clearInterval(healthTimer);
+    healthTimer = null;
+  }
+  if (authenticatedRecoveryTimer) {
+    clearTimeout(authenticatedRecoveryTimer);
+    authenticatedRecoveryTimer = null;
+  }
+  authenticatedRecoveryInFlight = false;
+  readyFinalizationInFlight = null;
+  botCallInFlight = false;
+  activeBotCall = null;
+  automaticCallReservation = null;
+}
+
+async function pauseHotPathForLock(state) {
+  if (shuttingDown || pausedByLock) return;
+  // Mark paused first so in-flight browser init/errors do not KeepAlive-loop.
+  pausedByLock = true;
+  phase = 'paused_by_lock';
+  connectionState = 'PAUSED_BY_LOCK';
+  logJson('info', 'lock-power-pause-start', {
+    reason: state?.reason || null,
+    screenLocked: Boolean(state?.screenLocked),
+    lidClosed: Boolean(state?.lidClosed),
+    phase,
+  });
+  stopHotTimers();
+  try {
+    await teardownBotCallMedia(client.pupPage).catch(() => {});
+  } catch {
+    // ignore
+  }
+  try {
+    if (client?.pupBrowser) await client.pupBrowser.close().catch(() => {});
+  } catch {
+    // ignore
+  }
+  try {
+    await client.destroy();
+  } catch (error) {
+    log.debug('lock-power-destroy-warning', truncateText(error?.message || String(error), 200));
+  }
+  await publishState({
+    pausedByLock: true,
+    paused_by_lock: true,
+    lockPower: {
+      ...lockPowerStatusSnapshot(),
+      reason: state?.reason || 'locked_or_lid_closed',
+      screenLocked: Boolean(state?.screenLocked),
+      lidClosed: Boolean(state?.lidClosed),
+    },
+  });
+  logJson('info', 'lock-power-paused', {
+    reason: state?.reason || null,
+    note: 'Chrome stopped; control socket remains; no caffeinate/prevent-sleep',
+  });
+}
+
+async function resumeHotPathAfterLock(state) {
+  if (shuttingDown || !pausedByLock) return;
+  logJson('info', 'lock-power-resume-restart', {
+    reason: state?.reason || null,
+    screenLocked: Boolean(state?.screenLocked),
+    lidClosed: Boolean(state?.lidClosed),
+  });
+  pausedByLock = false;
+  phase = 'resuming_after_lock';
+  await publishState({
+    pausedByLock: false,
+    paused_by_lock: false,
+    resumingAfterLock: true,
+  }).catch(() => {});
+  // Exit 1 so launchd KeepAlive restarts a clean browser session only after unlock.
+  await shutdown('lock-power-resume', 1);
 }
 
 async function removeQr() {
@@ -1169,6 +1292,9 @@ async function recoverAuthenticatedInitialization() {
 }
 
 async function ensureReady() {
+  if (pausedByLock || phase === 'paused_by_lock') {
+    throw new Error('WhatsApp backend is paused_by_lock (screen locked or lid closed). Unlock/open lid to resume.');
+  }
   if (phase !== 'ready') {
     throw new Error(`WhatsApp backend is not ready (phase=${phase}). Pair the linked device first.`);
   }
@@ -1315,16 +1441,19 @@ async function executeApprovedAction(draft) {
 
 async function dispatch(method, params = {}) {
   if (method === 'status') {
+    const lockPower = lockPowerStatusSnapshot();
     return {
       phase,
-      ready: phase === 'ready',
+      ready: phase === 'ready' && !pausedByLock,
       connectionState,
-      
-      qrAvailable: phase === 'pairing',
-      qrPath: phase === 'pairing' ? paths.qrFile : null,
+      qrAvailable: phase === 'pairing' && !pausedByLock,
+      qrPath: phase === 'pairing' && !pausedByLock ? paths.qrFile : null,
       qrUpdatedAt,
       readyAt,
       pid: process.pid,
+      pausedByLock,
+      paused_by_lock: pausedByLock,
+      lockPower,
     };
   }
 
@@ -1754,16 +1883,30 @@ async function handleConnection(socket) {
   activeSockets.add(socket);
   socket.setTimeout(35000, () => socket.destroy());
   socket.once('close', () => activeSockets.delete(socket));
+  // Client disconnects mid-response must not crash the daemon (EPIPE).
+  socket.on('error', (error) => {
+    log.debug('rpc-socket-error', truncateText(error?.message || String(error), 200));
+  });
   socket.setEncoding('utf8');
   let buffer = '';
   let handled = false;
+
+  const safeEnd = (payload) => {
+    if (socket.destroyed) return;
+    try {
+      socket.end(payload);
+    } catch (error) {
+      log.debug('rpc-socket-end-failed', truncateText(error?.message || String(error), 200));
+      socket.destroy();
+    }
+  };
 
   socket.on('data', async (chunk) => {
     if (handled) return;
     buffer += chunk;
     if (buffer.length > 1024 * 1024) {
       handled = true;
-      socket.end(`${JSON.stringify({ ok: false, error: 'Request exceeded the 1 MiB safety limit.' })}\n`);
+      safeEnd(`${JSON.stringify({ ok: false, error: 'Request exceeded the 1 MiB safety limit.' })}\n`);
       return;
     }
     const newline = buffer.indexOf('\n');
@@ -1773,10 +1916,10 @@ async function handleConnection(socket) {
       const request = JSON.parse(buffer.slice(0, newline));
       log.debug('rpc-request', `method=${request.method || 'missing'}`);
       const result = await dispatch(request.method, request.params);
-      socket.end(`${JSON.stringify({ id: request.id, ok: true, result })}\n`);
+      safeEnd(`${JSON.stringify({ id: request.id, ok: true, result })}\n`);
     } catch (error) {
       log.error('rpc-failed', truncateText(error.message, 300));
-      socket.end(`${JSON.stringify({ ok: false, error: error.message || 'Request failed.' })}\n`);
+      safeEnd(`${JSON.stringify({ ok: false, error: error.message || 'Request failed.' })}\n`);
     }
   });
 }
@@ -1829,6 +1972,10 @@ client.on('message_ack', (message, ack) => {
 });
 
 client.on('auth_failure', async (message) => {
+  if (pausedByLock || phase === 'paused_by_lock' || shuttingDown) {
+    log.info('auth-failure-ignored-during-lock-pause', truncateText(message, 200));
+    return;
+  }
   qrGeneration += 1;
   phase = 'auth-failure';
   await removeQr();
@@ -1837,12 +1984,18 @@ client.on('auth_failure', async (message) => {
 });
 
 client.on('change_state', async (state) => {
+  if (pausedByLock || phase === 'paused_by_lock') return;
   connectionState = state;
   await publishState();
   log.debug('connection-state', state);
 });
 
 client.on('disconnected', async (reason) => {
+  // Intentional client.destroy() during bag-safe pause must not KeepAlive-loop.
+  if (pausedByLock || phase === 'paused_by_lock' || shuttingDown) {
+    log.info('disconnected-ignored-during-lock-pause', String(reason));
+    return;
+  }
   phase = 'disconnected';
   connectionState = String(reason);
   qrGeneration += 1;
@@ -3104,6 +3257,13 @@ async function acceptIncomingCall(callInfo, {
 }
 
 client.on('call', async (call) => {
+  if (pausedByLock || phase === 'paused_by_lock') {
+    logJson('info', 'incoming-call-ignored-paused-by-lock', {
+      id: typeof call.id === 'string' ? call.id : null,
+      from: serializePeerJid(call.from),
+    });
+    return;
+  }
   const callId = typeof call.id === 'string' ? call.id : '';
   const peerJid = serializePeerJid(call.from);
   if (!callId) {
@@ -3242,8 +3402,12 @@ async function socketIsActive() {
 async function shutdown(signal, exitCode = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
-  if (healthTimer) clearInterval(healthTimer);
-  healthTimer = null;
+  try {
+    await lockPowerGuard?.stop?.();
+  } catch {
+    // ignore
+  }
+  stopHotTimers();
   log.info('shutdown-start', `signal=${signal}`);
   phase = 'stopping';
   await publishState().catch(() => {});
@@ -3262,6 +3426,44 @@ async function shutdown(signal, exitCode = 0) {
   await removeQr();
   log.info('shutdown-complete', `signal=${signal}`);
   process.exit(exitCode);
+}
+
+async function initializeBrowserSession() {
+  if (pausedByLock || shuttingDown) {
+    log.info('browser-initialize-skipped', 'paused_by_lock_or_shutdown');
+    return;
+  }
+  if (browserInitInFlight) return browserInitInFlight;
+  browserInitInFlight = (async () => {
+    log.info('browser-initialize', 'starting isolated headless Chrome');
+    let heartbeat = 0;
+    const heartbeatTimer = setInterval(() => {
+      heartbeat += 1;
+      log.info('browser-initialize-progress', `elapsed=${heartbeat}s phase=${phase}`);
+    }, 1000);
+    if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+    try {
+      await Promise.race([
+        client.initialize(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('WhatsApp initialization exceeded 180 seconds.')), 180000)),
+      ]);
+      if (pausedByLock || shuttingDown) {
+        log.info('browser-initialize-aborted-after-lock', 'discarding session started before pause');
+        await teardownBotCallMedia(client.pupPage).catch(() => {});
+        await client.destroy().catch(() => {});
+      }
+    } catch (error) {
+      if (pausedByLock || shuttingDown) {
+        log.info('browser-initialize-cancelled', truncateText(error?.message || String(error), 200));
+        return;
+      }
+      throw error;
+    } finally {
+      clearInterval(heartbeatTimer);
+      browserInitInFlight = null;
+    }
+  })();
+  return browserInitInFlight;
 }
 
 async function main() {
@@ -3362,7 +3564,17 @@ async function main() {
   // GET /api/status
   app.get('/api/status', async (req, res) => {
     try {
-      res.json({ ok: true, result: { phase, ready: phase === 'ready', connectionState } });
+      res.json({
+        ok: true,
+        result: {
+          phase,
+          ready: phase === 'ready' && !pausedByLock,
+          connectionState,
+          pausedByLock,
+          paused_by_lock: pausedByLock,
+          lockPower: lockPowerStatusSnapshot(),
+        },
+      });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message });
     }
@@ -3625,27 +3837,46 @@ async function main() {
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('uncaughtException', (error) => {
     log.error('uncaught-exception', error.stack || error.message);
+    // While bag-paused, swallow Chrome teardown races instead of crash-looping.
+    if (pausedByLock || phase === 'paused_by_lock') return;
     void shutdown('uncaughtException', 1);
   });
   process.on('unhandledRejection', (error) => {
     log.error('unhandled-rejection', error?.stack || error?.message || String(error));
+    if (pausedByLock || phase === 'paused_by_lock') return;
     void shutdown('unhandledRejection', 1);
   });
 
-  log.info('browser-initialize', 'starting isolated headless Chrome');
-  let heartbeat = 0;
-  const heartbeatTimer = setInterval(() => {
-    heartbeat += 1;
-    log.info('browser-initialize-progress', `elapsed=${heartbeat}s phase=${phase}`);
-  }, 1000);
-  try {
-    await Promise.race([
-      client.initialize(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('WhatsApp initialization exceeded 180 seconds.')), 180000)),
-    ]);
-  } finally {
-    clearInterval(heartbeatTimer);
+  lockPowerGuard = createLockPowerGuard({
+    enabled: lockPowerGuardEnabled,
+    intervalMs: Number(process.env.LOCK_POWER_GUARD_INTERVAL_MS || 5000),
+    readState: () => readPowerSessionState({
+      env: process.env,
+      lockHelperPath: lockStateHelperPath,
+    }),
+    onPause: async (state) => {
+      await pauseHotPathForLock(state);
+    },
+    onResume: async (state) => {
+      await resumeHotPathAfterLock(state);
+    },
+    log,
+  });
+  logJson('info', 'lock-power-guard-config', {
+    enabled: lockPowerGuardEnabled,
+    intervalMs: Number(process.env.LOCK_POWER_GUARD_INTERVAL_MS || 5000),
+    helper: lockStateHelperPath,
+    force: process.env.LOCK_POWER_GUARD_FORCE || null,
+  });
+  await lockPowerGuard.start();
+
+  if (pausedByLock) {
+    log.info('browser-initialize-deferred', 'screen locked or lid closed; Chrome will start after unlock');
+    await publishState();
+    return;
   }
+
+  await initializeBrowserSession();
 }
 
 main().catch(async (error) => {
