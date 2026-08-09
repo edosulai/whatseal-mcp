@@ -45,6 +45,11 @@ else
   IDLE_CHROME_MS="900000"
 fi
 MAX_HOT_BROWSERS="${MAX_HOT_BROWSERS:-1}"
+# Local TCP surfaces are opt-in. The Unix control socket remains always-on.
+# WHATSEAL_WEB_API=1 enables the general Web UI API; sends still require native approval.
+# WHATSAPP_CALL_AUDIO_HTTP=1 enables only the tokenized call-audio route.
+WHATSEAL_WEB_API="${WHATSEAL_WEB_API:-0}"
+WHATSAPP_CALL_AUDIO_HTTP="${WHATSAPP_CALL_AUDIO_HTTP:-0}"
 
 log() { printf '%s script=whatsapp-launchagent pid=%s event=%s detail=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$1" "${2:-}"; }
 vlog() { [[ "$VERBOSE" -eq 1 ]] && log "debug" "$*" || true; }
@@ -78,6 +83,7 @@ Options:
 Verbose mode prints every external command and decision branch.
 
 Memory defaults: BROWSER_POLICY=idle, IDLE_CHROME_MS=900000 (15m). Use always|idle|on_demand.
+TCP defaults: WHATSEAL_WEB_API=0, WHATSAPP_CALL_AUDIO_HTTP=0 (no listener for default WAV audio).
 EOF
 }
 
@@ -226,6 +232,9 @@ ${account_args}
     <key>WHATSAPP_LOCK_STATE_HELPER</key><string>${escaped_lock_helper}</string>
     <key>WHATSAPP_ACCOUNT_ID</key><string>${escaped_account}</string>
     <key>WHATSAPP_HTTP_PORT</key><string>${escaped_http_port}</string>
+    <!-- Local TCP surfaces default OFF. Port is inert unless one is explicitly enabled. -->
+    <key>WHATSEAL_WEB_API</key><string>${WHATSEAL_WEB_API}</string>
+    <key>WHATSAPP_CALL_AUDIO_HTTP</key><string>${WHATSAPP_CALL_AUDIO_HTTP}</string>
     <!-- Voice-bot defaults fail closed. Supply overrides only while rendering this private plist. -->
     <!-- Chrome is ALWAYS headless by default. Set WHATSAPP_DEBUG=1 only for testing/debugging. -->
     <key>WHATSAPP_DEBUG</key><string>${VOICE_DEBUG}</string>
@@ -341,6 +350,8 @@ case "$ACTION" in
     validate_boolean "WHATSAPP_BOT_AUDIO_INJECT" "$VOICE_BOT_AUDIO_INJECT"
     validate_boolean "WHATSAPP_BOT_HANGUP_AFTER_AUDIO" "$VOICE_BOT_HANGUP_AFTER_AUDIO"
     validate_boolean "LOCK_POWER_GUARD" "$LOCK_POWER_GUARD"
+    validate_boolean "WHATSEAL_WEB_API" "$WHATSEAL_WEB_API"
+    validate_boolean "WHATSAPP_CALL_AUDIO_HTTP" "$WHATSAPP_CALL_AUDIO_HTTP"
     [[ "$VOICE_BOT_HANGUP_PADDING_MS" =~ ^[0-9]+$ ]] || fail "WHATSAPP_BOT_HANGUP_PADDING_MS must be a non-negative integer"
     (( VOICE_BOT_HANGUP_PADDING_MS <= 60000 )) || fail "WHATSAPP_BOT_HANGUP_PADDING_MS must not exceed 60000"
     [[ "$LOCK_POWER_GUARD_INTERVAL_MS" =~ ^[0-9]+$ ]] || fail "LOCK_POWER_GUARD_INTERVAL_MS must be a non-negative integer"

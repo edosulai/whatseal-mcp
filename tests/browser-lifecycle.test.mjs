@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   buildBrowserLifecycleStatus,
+  createBrowserOperationCoordinator,
   isIdleColdPhase,
   methodNeedsBrowser,
   parseIdleChromeMs,
@@ -99,6 +100,18 @@ test('idle close only when warm ready browser exceeds timeout', () => {
   assert.equal(
     shouldIdleCloseBrowser({
       policy: 'idle',
+      idleChromeMs: 60_000,
+      now,
+      lastRpcAt: now - 61_000,
+      phase: 'ready',
+      chromeAlive: true,
+      activeBrowserOperations: 1,
+    }).reason,
+    'browser_operation_in_flight',
+  );
+  assert.equal(
+    shouldIdleCloseBrowser({
+      policy: 'idle',
       idleChromeMs: 0,
       now,
       lastRpcAt: now - 999_999,
@@ -131,10 +144,49 @@ test('status snapshot uses instaseal contract fields', () => {
   assert.equal(snap.nodeRssMb, 50);
   assert.ok(snap.lastRpcAt);
   assert.equal(methodNeedsBrowser('status'), false);
+  assert.equal(methodNeedsBrowser('compatibility'), false);
+  assert.equal(methodNeedsBrowser('compatibilitySelfTest'), true);
   assert.equal(methodNeedsBrowser('listChats'), true);
   assert.equal(methodNeedsBrowser('getSendOutcome'), false);
   assert.equal(methodNeedsBrowser('prepareSend'), true);
   assert.equal(isIdleColdPhase('idle_cold'), true);
   assert.equal(isIdleColdPhase('idle_no_browser'), true);
   assert.equal(isIdleColdPhase('ready'), false);
+});
+
+test('browser operation coordinator blocks admission during teardown transition', async () => {
+  const coordinator = createBrowserOperationCoordinator();
+  const events = [];
+  let markTransitionEntered;
+  const transitionEntered = new Promise((resolve) => {
+    markTransitionEntered = resolve;
+  });
+  let releaseTransition;
+  const transitionCanFinish = new Promise((resolve) => {
+    releaseTransition = resolve;
+  });
+
+  const transition = coordinator.withTransition(async () => {
+    events.push('transition-start');
+    markTransitionEntered();
+    await transitionCanFinish;
+    events.push('transition-end');
+  });
+  const operation = coordinator.beginOperation('listChats').then((release) => {
+    events.push('operation-admitted');
+    return release;
+  });
+
+  await transitionEntered;
+  assert.deepEqual(events, ['transition-start']);
+  assert.equal(coordinator.getStatus().activeOperations, 0);
+  releaseTransition();
+  await transition;
+  const releaseOperation = await operation;
+  assert.deepEqual(events, ['transition-start', 'transition-end', 'operation-admitted']);
+  assert.equal(coordinator.getStatus().activeOperations, 1);
+  assert.deepEqual(coordinator.getStatus().activeLabels, { listChats: 1 });
+  releaseOperation();
+  releaseOperation();
+  assert.equal(coordinator.getStatus().activeOperations, 0);
 });

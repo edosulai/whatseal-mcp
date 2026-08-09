@@ -161,7 +161,10 @@ const UsersProvider = ({ children }) => {
 
 		// Send via API
 		try {
-			await api.sendMessage(userId, message);
+			const result = await api.sendMessage(userId, message);
+			if (!result?.success) {
+				throw new Error(result?.outcome?.detail || `Send ${result?.outcome?.state || "was not approved"}`);
+			}
 			// Update status to delivered
 			setUsers((users) => {
 				let userIndex = users.findIndex((user) => user.id === userId);

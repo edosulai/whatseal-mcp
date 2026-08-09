@@ -33,6 +33,7 @@ import {
 } from './lib/lock-power-guard.mjs';
 import {
   buildBrowserLifecycleStatus,
+  createBrowserOperationCoordinator,
   IDLE_COLD_PHASE,
   isIdleColdPhase,
   methodNeedsBrowser,
@@ -42,6 +43,10 @@ import {
   shouldIdleCloseBrowser,
   shouldStartBrowserOnBoot,
 } from './lib/browser-lifecycle.mjs';
+import {
+  executeApprovedHttpSend,
+  parseLocalHttpPolicy,
+} from './lib/http-policy.mjs';
 
 import {
   deepProbeVoipStack,
@@ -111,6 +116,7 @@ const runtimeSourceFiles = [
   'lib/core.mjs',
   'lib/lock-power-guard.mjs',
   'lib/browser-lifecycle.mjs',
+  'lib/http-policy.mjs',
   'lib/call-policy.mjs',
   'lib/call-audio.mjs',
   'lib/call-bridge.mjs',
@@ -124,8 +130,19 @@ const runtimeSourceFiles = [
   'install-launchagent.sh',
   'package.json',
 ];
-const startupBackendSourceSha256Promise = hashNamedFiles(sourceRoot, runtimeSourceFiles);
-const startupInstalledDependenciesSha256Promise = hashDirectoryTree(path.join(sourceRoot, 'node_modules'));
+function captureStartupHash(promise) {
+  return promise.then(
+    (value) => ({ value, error: null }),
+    (error) => ({ value: null, error: truncateText(error?.message || String(error), 300) }),
+  );
+}
+
+const startupBackendSourceSha256Promise = captureStartupHash(
+  hashNamedFiles(sourceRoot, runtimeSourceFiles),
+);
+const startupInstalledDependenciesSha256Promise = captureStartupHash(
+  hashDirectoryTree(path.join(sourceRoot, 'node_modules')),
+);
 const { verbose, help } = parseCommonArgs(process.argv.slice(2));
 const log = createLogger('whatsapp-daemon', verbose);
 const drafts = new DraftStore();
@@ -164,6 +181,9 @@ const allowedCallerPhones = new Set(autoAcceptCallerConfig.callers);
 const botAudioInject = process.env.WHATSAPP_BOT_AUDIO_INJECT !== '0';
 const botHangupAfterAudio = process.env.WHATSAPP_BOT_HANGUP_AFTER_AUDIO !== '0';
 const botAudioMode = selectCallAudioMode(botAudioPath);
+const localHttpPolicy = parseLocalHttpPolicy(process.env);
+const callAudioHttpEnabled = localHttpPolicy.callAudioEnabled;
+const localHttpListenerEnabled = localHttpPolicy.webApiEnabled || callAudioHttpEnabled;
 // STRICT RULE: Always headless in production. Chrome window only for debugging.
 // Set WHATSAPP_DEBUG=1 to show Chrome window during testing/debugging.
 const voiceBotHeadless = process.env.WHATSAPP_DEBUG !== '1';
@@ -251,8 +271,10 @@ let chromeAlive = false;
 let lastRpcAt = Date.now();
 let idleTimer = null;
 let idleCloseInFlight = null;
+const browserOperations = createBrowserOperationCoordinator();
 let clientGeneration = 0;
 let client = null;
+let browserTeardownSession = null;
 
 const syntheticDocument = Buffer.from([
   'WhatsApp Agent E2E Test Document',
@@ -338,6 +360,16 @@ function isBrowserSessionCurrent(generation) {
   return generation === clientGeneration && client != null;
 }
 
+function isBrowserSessionAlive(session = client || browserTeardownSession) {
+  try {
+    const browser = session?.pupBrowser;
+    if (!browser) return false;
+    return typeof browser.isConnected === 'function' ? Boolean(browser.isConnected()) : true;
+  } catch {
+    return false;
+  }
+}
+
 function touchRpcActivity(at = Date.now()) {
   lastRpcAt = Number(at) || Date.now();
   scheduleIdleBrowserClose();
@@ -345,6 +377,13 @@ function touchRpcActivity(at = Date.now()) {
 
 /** @deprecated alias */
 const touchActivity = touchRpcActivity;
+
+function isBotAudioTransportReady() {
+  return !botAudioInject || (
+    botAudioReady
+    && (botAudioMode !== 'stream-url' || callAudioHttpEnabled)
+  );
+}
 
 function clearIdleTimer() {
   if (idleTimer) {
@@ -358,7 +397,7 @@ function scheduleIdleBrowserClose() {
   if (browserPolicy === 'always') return;
   if (!Number.isFinite(idleChromeMs) || idleChromeMs <= 0) return;
   if (pausedByLock || phase === 'paused_by_lock' || shuttingDown) return;
-  if (!chromeAlive || phase !== 'ready') return;
+  if (!isBrowserSessionAlive() || phase !== 'ready') return;
   idleTimer = setTimeout(() => {
     void maybeIdleCloseBrowser();
   }, idleChromeMs);
@@ -372,6 +411,8 @@ function processStatusSnapshot() {
   } catch {
     nodeRssBytes = null;
   }
+  chromeAlive = isBrowserSessionAlive();
+  const operationStatus = browserOperations.getStatus();
   const canWake = !pausedByLock
     && !shuttingDown
     && (isIdleColdPhase(phase) || phase === 'starting' || (!chromeAlive && phase !== 'auth-failure'));
@@ -385,11 +426,13 @@ function processStatusSnapshot() {
     pausedByLock,
     nodeRssBytes,
     canWake: Boolean(canWake || (chromeAlive && phase === 'ready')),
+    activeBrowserOperations: operationStatus.activeOperations,
   });
 }
 
 /** instaseal-compatible browser lifecycle fields for status / publishState. */
 function browserContractFields(processStatus = processStatusSnapshot()) {
+  const operationStatus = browserOperations.getStatus();
   return {
     browserPolicy,
     chromeAlive: Boolean(processStatus.chromeAlive ?? chromeAlive),
@@ -405,6 +448,8 @@ function browserContractFields(processStatus = processStatusSnapshot()) {
     canWake: processStatus.canWake,
     lastActivityAt: processStatus.lastRpcAt,
     process: processStatus,
+    activeBrowserOperations: operationStatus.activeOperations,
+    activeBrowserOperationLabels: operationStatus.activeLabels,
   };
 }
 
@@ -468,7 +513,6 @@ function stopHotTimers() {
   }
   clearIdleTimer();
   authenticatedRecoveryInFlight = false;
-  readyFinalizationInFlight = null;
   botCallInFlight = false;
   activeBotCall = null;
   automaticCallReservation = null;
@@ -477,9 +521,13 @@ function stopHotTimers() {
 async function destroyBrowserSession(reason = 'destroy') {
   stopHotTimers();
   const current = client;
-  chromeAlive = false;
-  browserInitInFlight = null;
   if (!current) return;
+  // Invalidate handlers immediately, while retaining the session only for an
+  // honest liveness probe until Chromium actually finishes closing.
+  clientGeneration += 1;
+  client = null;
+  browserTeardownSession = current;
+  chromeAlive = isBrowserSessionAlive(current);
   try {
     await teardownBotCallMedia(current.pupPage).catch(() => {});
   } catch {
@@ -495,14 +543,13 @@ async function destroyBrowserSession(reason = 'destroy') {
   } catch (error) {
     log.debug('browser-destroy-warning', `${reason}: ${truncateText(error?.message || String(error), 200)}`);
   }
-  // Invalidate any late event handlers from the destroyed client generation.
-  clientGeneration += 1;
-  client = null;
+  browserTeardownSession = null;
+  chromeAlive = false;
 }
 
 async function maybeIdleCloseBrowser() {
   if (idleCloseInFlight) return idleCloseInFlight;
-  idleCloseInFlight = (async () => {
+  idleCloseInFlight = browserOperations.withTransition(async () => {
     // paused_by_lock always wins over idle_cold (shouldIdleCloseBrowser gates this).
     const decision = shouldIdleCloseBrowser({
       policy: browserPolicy,
@@ -511,12 +558,17 @@ async function maybeIdleCloseBrowser() {
       lastRpcAt,
       phase,
       pausedByLock,
-      chromeAlive,
-      hasActiveBotCall: Boolean(activeBotCall || botCallInFlight),
+      chromeAlive: isBrowserSessionAlive(),
+      hasActiveBotCall: Boolean(botCallInFlight || (
+        activeBotCall?.id && !isCallTerminal(activeBotCall.id, activeBotCall.from)
+      )),
       sendApprovalInFlight,
+      activeBrowserOperations: browserOperations.getStatus().activeOperations,
     });
     if (!decision.shouldClose) {
-      if (decision.reason === 'still_warm') scheduleIdleBrowserClose();
+      if (['still_warm', 'active_bot_call', 'approval_in_flight', 'browser_operation_in_flight'].includes(decision.reason)) {
+        scheduleIdleBrowserClose();
+      }
       return;
     }
     logJson('info', 'browser-idle-close-start', {
@@ -552,7 +604,7 @@ async function pauseHotPathForLock(state) {
     lidClosed: Boolean(state?.lidClosed),
     phase,
   });
-  await destroyBrowserSession('lock-power');
+  await browserOperations.withTransition(() => destroyBrowserSession('lock-power'));
   await publishState({
     pausedByLock: true,
     paused_by_lock: true,
@@ -583,8 +635,9 @@ async function resumeHotPathAfterLock(state) {
     paused_by_lock: false,
     resumingAfterLock: true,
   }).catch(() => {});
-  // Exit 1 so launchd KeepAlive restarts a clean browser session only after unlock.
-  await shutdown('lock-power-resume', 1);
+  // Let this guard callback settle before shutdown calls guard.stop(). Calling
+  // stop while still inside onResume would wait on this same callback forever.
+  setImmediate(() => void shutdown('lock-power-resume', 1));
 }
 
 async function removeQr() {
@@ -736,23 +789,37 @@ async function hashDirectoryTree(root) {
 }
 
 async function getRuntimeAttestation() {
-  const backendStartupSourceSha256 = await startupBackendSourceSha256Promise;
-  const backendCurrentDiskSourceSha256 = await hashNamedFiles(sourceRoot, runtimeSourceFiles);
+  const backendStartup = await startupBackendSourceSha256Promise;
+  const installedDependenciesStartup = await startupInstalledDependenciesSha256Promise;
+  const backendCurrentDisk = await captureStartupHash(hashNamedFiles(sourceRoot, runtimeSourceFiles));
+  const messageApprovalHelper = await captureStartupHash(hashFile(approvalHelper));
+  const baselineApprovalHelper = await captureStartupHash(hashFile(`${paths.state}/native-baseline-approval`));
   return {
-    backendStartupSourceSha256,
-    backendCurrentDiskSourceSha256,
-    backendSourceMatchesStartup: backendStartupSourceSha256 === backendCurrentDiskSourceSha256,
-    installedDependenciesStartupSha256: await startupInstalledDependenciesSha256Promise,
-    messageApprovalHelperSha256: await hashFile(approvalHelper),
-    baselineApprovalHelperSha256: await hashFile(`${paths.state}/native-baseline-approval`),
+    backendStartupSourceSha256: backendStartup.value,
+    backendCurrentDiskSourceSha256: backendCurrentDisk.value,
+    backendSourceMatchesStartup: Boolean(
+      backendStartup.value
+      && backendCurrentDisk.value
+      && backendStartup.value === backendCurrentDisk.value
+    ),
+    installedDependenciesStartupSha256: installedDependenciesStartup.value,
+    messageApprovalHelperSha256: messageApprovalHelper.value,
+    baselineApprovalHelperSha256: baselineApprovalHelper.value,
+    attestationErrors: {
+      backendStartupSource: backendStartup.error,
+      backendCurrentDiskSource: backendCurrentDisk.error,
+      installedDependenciesStartup: installedDependenciesStartup.error,
+      messageApprovalHelper: messageApprovalHelper.error,
+      baselineApprovalHelper: baselineApprovalHelper.error,
+    },
   };
 }
 
 async function getCompatibilityReport() {
-  const whatsappWebVersion = client.pupPage
+  const whatsappWebVersion = client?.pupPage
     ? await client.getWWebVersion().catch(() => null)
     : null;
-  const browserVersion = client.pupBrowser
+  const browserVersion = client?.pupBrowser
     ? await client.pupBrowser.version().catch(() => null)
     : null;
   const packageLockSha256 = createHash('sha256')
@@ -793,6 +860,8 @@ async function getCompatibilityReport() {
       sendRateLimitPerHour: 20,
       sendRateLimitPerDay: 100,
       dependencyAutoUpdate: false,
+      localWebApiEnabled: localHttpPolicy.webApiEnabled,
+      callAudioHttpEnabled,
     },
   };
   const baseline = await readJson(paths.compatibilityBaseline, null);
@@ -847,8 +916,8 @@ async function writeCompatibilitySnapshot() {
 
 async function getCompatibilitySelfTest() {
   const report = await getCompatibilityReport();
-  const state = await client.getState().catch(() => null);
-  const pageProbe = client.pupPage
+  const state = client ? await client.getState().catch(() => null) : null;
+  const pageProbe = client?.pupPage
     ? await client.pupPage.evaluate(() => ({
         documentReady: document.readyState === 'complete',
         streamModelAvailable: Boolean(window.require?.('WAWebStreamModel')?.Stream),
@@ -901,10 +970,13 @@ async function getSecurityAudit() {
   await checkPath('message-approval-helper', approvalHelper, '0500', 'file');
   await checkPath('baseline-approval-helper', `${paths.state}/native-baseline-approval`, '0500', 'file');
 
-  const browserArgs = client.pupBrowser?.process()?.spawnargs || [];
+  const browserArgs = client?.pupBrowser?.process()?.spawnargs || [];
+  const browserAvailable = isBrowserSessionAlive();
   checks.push({
     name: 'chrome-debug-transport',
-    passed: browserArgs.includes('--remote-debugging-pipe') && !browserArgs.some((arg) => arg.startsWith('--remote-debugging-port')),
+    passed: !browserAvailable
+      || (browserArgs.includes('--remote-debugging-pipe') && !browserArgs.some((arg) => arg.startsWith('--remote-debugging-port'))),
+    skippedWhileBrowserCold: !browserAvailable,
     remoteDebuggingPipe: browserArgs.includes('--remote-debugging-pipe'),
     remoteDebuggingPort: browserArgs.some((arg) => arg.startsWith('--remote-debugging-port')),
   });
@@ -1269,6 +1341,9 @@ function isCallTerminal(callId, peerJid = activeBotCall?.id === callId ? activeB
 }
 
 function issueBotAudioGrant(callId, peerJid, { automatic = activeBotCall?.automatic === true } = {}) {
+  if (!callAudioHttpEnabled) {
+    throw new Error('Compressed bot audio requires WHATSAPP_CALL_AUDIO_HTTP=1 and a daemon restart.');
+  }
   const peer = serializePeerJid(peerJid);
   const lifecycle = getBotAudioLifecycle(callId, peer, { automatic });
   if (!lifecycle.allowed) throw new Error(lifecycle.reason);
@@ -1327,7 +1402,7 @@ async function installCallEndedBinding() {
 }
 
 async function finalizeReady(source) {
-  if (phase === 'ready' && chromeAlive && client) return;
+  if (phase === 'ready' && isBrowserSessionAlive() && client) return;
   if (readyFinalizationInFlight) return await readyFinalizationInFlight;
   readyFinalizationInFlight = (async () => {
     if (!client) throw new Error('No WhatsApp client is available to finalize ready.');
@@ -1342,7 +1417,8 @@ async function finalizeReady(source) {
     if (authenticatedRecoveryTimer) clearTimeout(authenticatedRecoveryTimer);
     authenticatedRecoveryTimer = null;
     phase = 'ready';
-    chromeAlive = true;
+    chromeAlive = isBrowserSessionAlive();
+    if (!chromeAlive) throw new Error('Chromium session closed before ready finalization completed.');
     readyAt = new Date().toISOString();
     connectionState = state;
     touchActivity();
@@ -1393,7 +1469,7 @@ async function finalizeReady(source) {
             || phase === 'paused_by_lock'
             || isIdleColdPhase(phase)
             || shuttingDown
-            || !chromeAlive
+            || !isBrowserSessionAlive()
             || !client
           ) {
             return;
@@ -1412,7 +1488,7 @@ async function finalizeReady(source) {
             || phase === 'paused_by_lock'
             || isIdleColdPhase(phase)
             || shuttingDown
-            || !chromeAlive
+            || !isBrowserSessionAlive()
           ) {
             return;
           }
@@ -1490,14 +1566,14 @@ async function ensureReady(reason = 'rpc') {
     throw new Error('WhatsApp backend is paused_by_lock (screen locked or lid closed). Unlock/open lid to resume.');
   }
   touchRpcActivity();
-  if (phase === 'ready' && chromeAlive && client) return;
+  if (phase === 'ready' && isBrowserSessionAlive() && client) return;
 
   // Idle / on-demand: cold-start Chrome on first method that needs WhatsApp (lazy warm).
   if (
     isIdleColdPhase(phase)
     || phase === 'starting'
     || phase === 'resuming_after_lock'
-    || (!chromeAlive && phase !== 'pairing' && phase !== 'authenticated' && phase !== 'auth-failure')
+    || (!isBrowserSessionAlive() && phase !== 'pairing' && phase !== 'authenticated' && phase !== 'auth-failure')
   ) {
     logJson('info', 'browser-ensure-start', { reason, phase, policy: browserPolicy, idleChromeMs });
     phase = 'starting';
@@ -1509,7 +1585,7 @@ async function ensureReady(reason = 'rpc') {
       if (pausedByLock || phase === 'paused_by_lock') {
         throw new Error('WhatsApp backend is paused_by_lock (screen locked or lid closed). Unlock/open lid to resume.');
       }
-      if (phase === 'ready' && chromeAlive && client) {
+      if (phase === 'ready' && isBrowserSessionAlive() && client) {
         touchRpcActivity();
         return;
       }
@@ -1527,7 +1603,7 @@ async function ensureReady(reason = 'rpc') {
     throw new Error(`WhatsApp backend wake timed out (phase=${phase}).`);
   }
 
-  if (phase !== 'ready' || !chromeAlive || !client) {
+  if (phase !== 'ready' || !isBrowserSessionAlive() || !client) {
     throw new Error(`WhatsApp backend is not ready (phase=${phase}). Pair the linked device first.`);
   }
 }
@@ -1674,7 +1750,7 @@ async function executeApprovedAction(draft) {
   throw new Error(`Unsupported approved action: ${draft.action}`);
 }
 
-async function dispatch(method, params = {}) {
+async function dispatchCore(method, params = {}) {
   if (method === 'status') {
     const lockPower = lockPowerStatusSnapshot();
     const processStatus = processStatusSnapshot();
@@ -1730,7 +1806,7 @@ async function dispatch(method, params = {}) {
       autoAcceptEffective: autoAcceptCalls
         && autoAcceptCallerConfig.valid
         && allowedCallerPhones.size > 0
-        && (!botAudioInject || botAudioReady),
+        && isBotAudioTransportReady(),
       allowlist: {
         valid: autoAcceptCallerConfig.valid,
         count: allowedCallerPhones.size,
@@ -1744,20 +1820,6 @@ async function dispatch(method, params = {}) {
     };
   }
 
-
-  // Browser-backed experimental call helpers + chat lock unlock need a live session.
-  if ([
-    'deepProbeVoipStack',
-    'probeCallBridge',
-    'rejectCall',
-    'exploreCallApi',
-    'acceptCall',
-    'hangupCall',
-    'unlockChatLock',
-  ].includes(method)) {
-    touchActivity();
-    await ensureReady();
-  }
 
   if (method === 'deepProbeVoipStack') {
     try {
@@ -1773,7 +1835,7 @@ async function dispatch(method, params = {}) {
       autoAcceptEffective: autoAcceptCalls
         && autoAcceptCallerConfig.valid
         && allowedCallerPhones.size > 0
-        && (!botAudioInject || botAudioReady),
+        && isBotAudioTransportReady(),
       allowlist: {
         configured: allowedCallerPhones.size > 0,
         valid: autoAcceptCallerConfig.valid,
@@ -1786,6 +1848,8 @@ async function dispatch(method, params = {}) {
       botAudioPath,
       botAudioMode,
       botAudioReady,
+      botAudioTransportReady: isBotAudioTransportReady(),
+      callAudioHttpEnabled,
       botHangupPaddingMs,
       headless: voiceBotHeadless,
       toggles: {
@@ -1909,12 +1973,6 @@ async function dispatch(method, params = {}) {
     }
   }
 
-  if (methodNeedsBrowser(method)) {
-    // Touch activity and wake Chrome for methods that need WhatsApp Web.
-    touchActivity();
-    await ensureReady();
-  }
-
   if (method === 'clearSearch') {
     try {
       const result = await clearWhatsAppSearchBox();
@@ -1962,31 +2020,6 @@ async function dispatch(method, params = {}) {
     const messageId = String(params.messageId || '').trim();
     if (!messageId) throw new Error('A message ID is required.');
     return await getMessageStatusDirect(messageId);
-  }
-
-  // Direct send without approval - for trusted web UI only
-  if (method === 'directSend') {
-    assertSendRateLimit();
-    const text = String(params.text || '').trim();
-    if (!text) throw new Error('Message text cannot be empty.');
-    if (text.length > 10000) throw new Error('Message text exceeds the 10,000-character safety limit.');
-    const chat = await resolveChat(params.chat);
-    const sent = await client.sendMessage(chat.id, text, {
-      sendSeen: false,
-      waitUntilMsgSent: true,
-    });
-    await client.sendPresenceUnavailable().catch(() => {});
-    return sent
-      ? {
-          success: true,
-          message: {
-            id: sent.id?._serialized || '',
-            timestamp: Number(sent.timestamp || 0),
-            ack: Number(sent.ack ?? 0),
-            type: sent.type || 'chat',
-          },
-        }
-      : { success: true, message: null, detail: 'Message sent but no confirmation object returned.' };
   }
 
   if (method === 'prepareSend') {
@@ -2135,6 +2168,27 @@ async function dispatch(method, params = {}) {
   throw new Error(`Unknown backend method: ${method}`);
 }
 
+async function dispatch(method, params = {}) {
+  if (method === 'directSend') {
+    throw new Error('directSend is disabled. Use prepareSend followed by requestLocalApproval.');
+  }
+  if (!methodNeedsBrowser(method)) return await dispatchCore(method, params);
+
+  return await runBrowserOperation(method, () => dispatchCore(method, params));
+}
+
+async function runBrowserOperation(label, operation) {
+  const releaseBrowserOperation = await browserOperations.beginOperation(label);
+  try {
+    touchRpcActivity();
+    await ensureBrowser(label);
+    return await operation();
+  } finally {
+    releaseBrowserOperation();
+    touchRpcActivity();
+  }
+}
+
 async function handleConnection(socket) {
   activeSockets.add(socket);
   socket.setTimeout(35000, () => socket.destroy());
@@ -2245,7 +2299,6 @@ function bindClientLifecycleEvents(session, generation) {
       || phase === 'paused_by_lock'
       || isIdleColdPhase(phase)
       || shuttingDown
-      || !chromeAlive
     ) {
       log.info('auth-failure-ignored-during-intentional-teardown', truncateText(message, 200));
       return;
@@ -2259,7 +2312,7 @@ function bindClientLifecycleEvents(session, generation) {
 
   session.on('change_state', async (state) => {
     if (!isBrowserSessionCurrent(generation)) return;
-    if (pausedByLock || phase === 'paused_by_lock' || isIdleColdPhase(phase) || !chromeAlive) return;
+    if (pausedByLock || phase === 'paused_by_lock' || isIdleColdPhase(phase) || shuttingDown) return;
     connectionState = state;
     await publishState();
     log.debug('connection-state', state);
@@ -2276,7 +2329,6 @@ function bindClientLifecycleEvents(session, generation) {
       || phase === 'paused_by_lock'
       || isIdleColdPhase(phase)
       || shuttingDown
-      || !chromeAlive
     ) {
       log.info('disconnected-ignored-during-intentional-teardown', String(reason));
       return;
@@ -2292,7 +2344,7 @@ function bindClientLifecycleEvents(session, generation) {
 
   session.on('call', async (call) => {
     if (!isBrowserSessionCurrent(generation)) return;
-    if (pausedByLock || phase === 'paused_by_lock' || isIdleColdPhase(phase) || !chromeAlive || shuttingDown) {
+    if (pausedByLock || phase === 'paused_by_lock' || isIdleColdPhase(phase) || !isBrowserSessionAlive(session) || shuttingDown) {
       logJson('info', 'incoming-call-ignored-browser-unavailable', {
         id: typeof call.id === 'string' ? call.id : null,
         from: serializePeerJid(call.from),
@@ -3726,7 +3778,7 @@ async function initializeBrowserSession() {
     log.info('browser-initialize-skipped', 'paused_by_lock_or_shutdown');
     return;
   }
-  if (phase === 'ready' && chromeAlive && client) return;
+  if (phase === 'ready' && isBrowserSessionAlive() && client) return;
   if (browserInitInFlight) return browserInitInFlight;
   browserInitInFlight = (async () => {
     // Recreate Client after idle/lock destroy — re-initialize on a dead Client is unreliable.
@@ -3787,6 +3839,9 @@ async function main() {
       const metadata = await getBotAudioMetadata();
       botAudioReady = true;
       logJson('info', 'voice-bot-audio-ready', metadata);
+      if (botAudioMode === 'stream-url' && !callAudioHttpEnabled) {
+        log.error('voice-bot-audio-http-disabled', 'set WHATSAPP_CALL_AUDIO_HTTP=1 to stream compressed bot audio');
+      }
     } catch (error) {
       botAudioReady = false;
       log.error('voice-bot-audio-missing', `${botAudioPath}: ${error.message}`);
@@ -3835,11 +3890,14 @@ async function main() {
   await publishState();
   log.info('control-socket-ready', `path=${paths.socket}`);
 
-  // Start HTTP API server for Web UI (no fingerprint required)
+  if (localHttpListenerEnabled) {
+  // Local TCP is opt-in. A compressed call-bot greeting may enable only the
+  // narrow tokenized audio route; general Web UI APIs require WHATSEAL_WEB_API=1.
   const app = express();
   app.use(express.json());
 
   // Narrow browser Private Network Access only to the per-call audio grant.
+  if (callAudioHttpEnabled) {
   app.options('/api/internal/call-audio/:token', (req, res) => {
     if (req.headers.origin !== 'https://web.whatsapp.com') return res.status(403).end();
     if (!requestHasActiveBotAudioGrant(req)) return res.status(404).end();
@@ -3852,8 +3910,10 @@ async function main() {
   });
   app.get('/api/internal/call-audio/:token', serveBotAudio);
   app.head('/api/internal/call-audio/:token', serveBotAudio);
+  }
 
-  // Existing Web UI CORS behavior. Never opt these general APIs into browser
+  if (localHttpPolicy.webApiEnabled) {
+  // Opt-in Web UI CORS behavior. Never opt these general APIs into browser
   // Private Network Access; the call-audio route handles its own narrow policy.
   app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
@@ -3888,8 +3948,7 @@ async function main() {
   // GET /api/me - get current WhatsApp user info
   app.get('/api/me', async (req, res) => {
     try {
-      await ensureReady();
-      const info = client.info;
+      const info = await runBrowserOperation('http:getMe', async () => client.info);
       res.json({
         ok: true,
         result: {
@@ -3942,8 +4001,10 @@ async function main() {
   // GET /api/chats
   app.get('/api/chats', async (req, res) => {
     try {
-      await ensureReady();
-      const chats = await getChatSummaries({ includeLastMessage: true });
+      const chats = await runBrowserOperation(
+        'http:listChats',
+        () => getChatSummaries({ includeLastMessage: true }),
+      );
       const transformed = chats.map(chat => ({
         id: chat.id,
         name: chat.name || chat.id,
@@ -3964,10 +4025,12 @@ async function main() {
   // GET /api/messages/:chatId
   app.get('/api/messages/:chatId', async (req, res) => {
     try {
-      await ensureReady();
       const { chatId } = req.params;
       const limit = Math.min(Number(req.query.limit) || 50, 100);
-      const messages = await getMessagesDirect(chatId, limit);
+      const messages = await runBrowserOperation(
+        'http:getMessages',
+        () => getMessagesDirect(chatId, limit),
+      );
       const transformed = messages.map(msg => ({
         content: msg.body,
         sender: msg.fromMe ? null : chatId,
@@ -3988,7 +4051,6 @@ async function main() {
   // GET /api/media/:messageId - serve media (stickers, images, etc)
   app.get('/api/media/:messageId', async (req, res) => {
     try {
-      await ensureReady();
       const { messageId } = req.params;
       const decodedId = decodeURIComponent(messageId);
       log.info('media-request', `messageId=${decodedId}`);
@@ -4001,7 +4063,7 @@ async function main() {
       const chatId = parts[1];
       
       // Download media directly via puppeteer using WWebJS pattern
-      const mediaData = await client.pupPage.evaluate(async (targetChatId, targetMsgId) => {
+      const mediaData = await runBrowserOperation('http:getMedia', () => client.pupPage.evaluate(async (targetChatId, targetMsgId) => {
         try {
           const chat = await window.WWebJS.getChat(targetChatId, { getAsModel: false });
           if (!chat) return { error: 'Chat not found' };
@@ -4083,7 +4145,7 @@ async function main() {
         } catch (e) {
           return { error: e.message || String(e) };
         }
-      }, chatId, decodedId);
+      }, chatId, decodedId));
       
       if (mediaData.error) {
         log.error('media-download-error', mediaData.error);
@@ -4102,41 +4164,33 @@ async function main() {
     }
   });
 
-  // POST /api/send - Direct send without fingerprint (Web UI only)
+  // POST /api/send - same immutable draft + native approval path as MCP.
   app.post('/api/send', async (req, res) => {
     try {
-      await ensureReady();
       const { chatId, text } = req.body;
-      if (!chatId || !text) return res.status(400).json({ error: 'chatId and text required' });
-      
-      assertSendRateLimit();
-      const chat = await resolveChat(chatId);
-      const sent = await client.sendMessage(chat.id, text, {
-        sendSeen: false,
-        waitUntilMsgSent: true,
-      });
-      await client.sendPresenceUnavailable().catch(() => {});
-      
-      res.json({
-        success: true,
-        message: sent ? {
-          id: sent.id?._serialized || '',
-          timestamp: Number(sent.timestamp || 0),
-          ack: Number(sent.ack ?? 0),
-        } : null
-      });
+      res.json(await executeApprovedHttpSend(dispatch, { chatId, text }));
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      const badRequest = /chatId and text required/i.test(err.message);
+      res.status(badRequest ? 400 : 500).json({ error: err.message });
     }
   });
+  }
 
-  // Multi-account: each daemon binds its own localhost HTTP port from the account id.
+  // Multi-account: an opted-in daemon binds its own localhost HTTP port.
   httpServer = http.createServer(app);
   await new Promise((resolve, reject) => {
     httpServer.once('error', reject);
     httpServer.listen(httpPort, '127.0.0.1', resolve);
   });
-  log.info('http-api-ready', `account=${accountId || 'default'} port=${httpPort} url=http://localhost:${httpPort}`);
+  logJson('info', 'http-api-ready', {
+    account: accountId || 'default',
+    port: httpPort,
+    webApiEnabled: localHttpPolicy.webApiEnabled,
+    callAudioHttpEnabled,
+  });
+  } else {
+    log.info('http-api-disabled', 'no TCP listener; enable WHATSEAL_WEB_API=1 explicitly for Web UI');
+  }
 
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));
@@ -4147,7 +4201,7 @@ async function main() {
       pausedByLock
       || phase === 'paused_by_lock'
       || isIdleColdPhase(phase)
-      || (!chromeAlive && phase !== 'failed' && phase !== 'disconnected')
+      || shuttingDown
     ) return;
     void shutdown('uncaughtException', 1);
   });
@@ -4157,7 +4211,7 @@ async function main() {
       pausedByLock
       || phase === 'paused_by_lock'
       || isIdleColdPhase(phase)
-      || (!chromeAlive && phase !== 'failed' && phase !== 'disconnected')
+      || shuttingDown
     ) return;
     void shutdown('unhandledRejection', 1);
   });

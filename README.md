@@ -29,8 +29,11 @@ biometric approval.
   Chrome closed until the first WA RPC even after unlock. Soft cap docs: `MAX_HOT_BROWSERS=1`.
   Status contract (shared with instaseal): `chromeAlive`, `browserPolicy`, `idleChromeMs`,
   `idleForMs`, `lastRpcAt`; cold phase `idle_cold`. `paused_by_lock` always wins over idle.
-- The control interface is a Unix-domain socket with mode `0600`; there is no
-  TCP listener.
+- The control interface is a Unix-domain socket with mode `0600`. There is no
+  TCP listener by default. The general Web API is explicit opt-in with
+  `WHATSEAL_WEB_API=1`; Web sends still use the immutable native Touch ID/password
+  approval flow. Compressed call-bot audio can separately enable only a random-token,
+  active-call-bound loopback route; the default decoded WAV path needs no TCP.
 - A sensitive, persistent WhatsApp browser profile lives under
   `~/.local/share/whatsapp-agent/auth` with mode `0700`. It contains linked
   device credentials plus browser-side WhatsApp caches. It must never be
@@ -61,6 +64,7 @@ biometric approval.
 | `daemon.mjs` | Headless Chrome + WhatsApp client + private Unix socket |
 | `lib/lock-power-guard.mjs` | Built-in lock/clamshell power policy (bag-safe default) |
 | `lib/browser-lifecycle.mjs` | Idle / on-demand browser policy helpers |
+| `lib/http-policy.mjs` | Default-off local HTTP policy + approval-safe Web send adapter |
 | `mcp-server.mjs` | Agent tools over MCP stdio |
 | `cli.mjs` | Local diagnostic and emergency command-line interface |
 | `install-launchagent.sh` | Idempotent macOS LaunchAgent lifecycle |
@@ -175,7 +179,7 @@ and evolving surface, so verify this behavior after dependency or WhatsApp updat
   send, reaction, and mark-read.
 - Rate limiting: 20 messages/hour, 100 messages/day, 3-second cooldown.
 - No chat history stored locally.
-- No TCP listener; Unix socket with mode 0600.
+- No TCP listener by default; Unix socket with mode 0600.
 - Reading chats never requires approval.
 
 ```bash
@@ -195,6 +199,21 @@ Every script supports `--verbose` / `-v`.
 - Stop: `./install-launchagent.sh stop`
 - Remove autostart: `./install-launchagent.sh remove`
 - Test: `npm run check`
+- Real-process lifecycle E2E: `npm run test:e2e`
+
+### Optional Web UI
+
+The Web UI and gateway are not part of the default daemon attack surface. Enable
+the per-account API explicitly while installing each account, then run the gateway:
+
+`WHATSEAL_WEB_API=1 ./install-launchagent.sh install --account alpha`
+
+`npm run web`
+
+The gateway uses one user-facing loopback port (`127.0.0.1:3000`) and proxies to
+the selected account. Posting `/api/send` prepares an immutable draft and opens
+the same native Touch ID/password approval used by MCP; there is no direct-send
+RPC or HTTP bypass.
 
 ### Lock / clamshell power policy (default ON)
 

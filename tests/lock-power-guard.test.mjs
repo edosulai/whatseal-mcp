@@ -125,3 +125,41 @@ test('disabled guard never pauses', async () => {
   assert.equal(guard.isPausedByLock(), false);
   await guard.stop();
 });
+
+test('stop called from resume callback does not await itself', async () => {
+  let locked = true;
+  let guard;
+  let resumed = false;
+  guard = createLockPowerGuard({
+    enabled: true,
+    intervalMs: 60_000,
+    readState: async () => {
+      const decision = decidePowerPause({ screenLocked: locked, lidClosed: false });
+      return {
+        screenLocked: locked,
+        lidClosed: false,
+        shouldPause: decision.shouldPause,
+        reason: decision.reason,
+        reasons: decision.reasons,
+        source: 'test',
+        available: { screenLocked: true, lidClosed: true },
+      };
+    },
+    onResume: async () => {
+      await guard.stop();
+      resumed = true;
+    },
+  });
+
+  await guard.start();
+  locked = false;
+  await Promise.race([
+    guard.pollOnce(),
+    new Promise((_, reject) => {
+      const timer = setTimeout(() => reject(new Error('resume callback self-deadlocked')), 1000);
+      timer.unref?.();
+    }),
+  ]);
+  assert.equal(resumed, true);
+  assert.equal(guard.getStatus().running, false);
+});
