@@ -292,7 +292,7 @@ const syntheticVCard = [
   'END:VCARD',
 ].join('\r\n');
 
-const chromePath = process.env.WHATSAPP_CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const chromePath = process.env.WHATSAPP_CHROME_PATH || await require('puppeteer').executablePath();
 const approvalHelper = process.env.WHATSAPP_APPROVAL_HELPER || `${paths.state}/native-approval`;
 
 function createWhatsAppClient() {

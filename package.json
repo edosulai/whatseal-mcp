@@ -23,6 +23,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
     "express": "^4.22.2",
+    "puppeteer": "25.4.0",
     "qrcode": "1.5.4",
     "whatsapp-web.js": "git+https://github.com/wwebjs/whatsapp-web.js.git#1780711a1c86dfeca7c5ba6a66f950eac93dde28",
     "zod": "4.4.3"

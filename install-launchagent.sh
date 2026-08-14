@@ -9,7 +9,7 @@ BASE_STATE_DIR="${WHATSAPP_AGENT_STATE:-${HOME}/.local/state/whatsapp-agent}"
 BASE_ROOT_DIR="${WHATSAPP_AGENT_ROOT:-${HOME}/.local/share/whatsapp-agent}"
 STATE_DIR="$BASE_STATE_DIR"
 ROOT_DIR="$BASE_ROOT_DIR"
-CHROME_PATH="${WHATSAPP_CHROME_PATH:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+CHROME_PATH="${WHATSAPP_CHROME_PATH:-}"
 PLIST_DIR="${HOME}/Library/LaunchAgents"
 PLIST="${PLIST_DIR}/${LABEL}.plist"
 MARKER="${STATE_DIR}/launchagent-owned"
@@ -273,6 +273,22 @@ EOF
   chmod 600 "$MARKER"
 }
 
+resolve_chrome_path() {
+  local managed=0
+  if [[ -z "$CHROME_PATH" ]]; then
+    managed=1
+    CHROME_PATH="$("$NODE_BIN" -e '(async()=>{const path=require("node:path"); const {createRequire}=require("node:module"); const fromProject=createRequire(path.join(process.argv[1], "package.json")); process.stdout.write(await fromProject("puppeteer").executablePath())})().catch((error)=>{console.error(error); process.exit(1)})' "$SCRIPT_DIR")"
+    if [[ ! -x "$CHROME_PATH" ]] || ! "$CHROME_PATH" --version >/dev/null 2>&1; then
+      "$NODE_BIN" -e 'const path=require("node:path"); const {createRequire}=require("node:module"); const fromProject=createRequire(path.join(process.argv[1], "package.json")); const {getInstalledBrowsers,uninstall}=fromProject("@puppeteer/browsers"); const executable=process.argv[2]; (async()=>{for(let current=path.dirname(executable);current!==path.dirname(current);current=path.dirname(current)){const installed=await getInstalledBrowsers({cacheDir:current}); const match=installed.find(browser=>browser.executablePath===executable); if(match){await uninstall({cacheDir:current,browser:match.browser,buildId:match.buildId,platform:match.platform}); return}}})().catch(error=>{console.error(error);process.exit(1)})' "$SCRIPT_DIR" "$CHROME_PATH"
+      log "progress" "installing dedicated Chrome for Testing"
+      run "$NPM_BIN" exec --prefix "$SCRIPT_DIR" -- puppeteer browsers install chrome
+      CHROME_PATH="$("$NODE_BIN" -e '(async()=>{const path=require("node:path"); const {createRequire}=require("node:module"); const fromProject=createRequire(path.join(process.argv[1], "package.json")); process.stdout.write(await fromProject("puppeteer").executablePath())})().catch((error)=>{console.error(error); process.exit(1)})' "$SCRIPT_DIR")"
+    fi
+  fi
+  [[ "$CHROME_PATH" == /* ]] || fail "WHATSAPP_CHROME_PATH must be absolute"
+  [[ -x "$CHROME_PATH" ]] && "$CHROME_PATH" --version >/dev/null 2>&1 || fail "$([[ "$managed" -eq 1 ]] && printf 'Chrome for Testing' || printf 'WHATSAPP_CHROME_PATH') is not usable at $CHROME_PATH"
+}
+
 install_dependencies_transactional() {
   local live="${SCRIPT_DIR}/node_modules"
   local backup="${SCRIPT_DIR}/.node_modules.previous.$$"
@@ -380,8 +396,7 @@ case "$ACTION" in
       [[ "$VOICE_BOT_AUDIO" == /* ]] || fail "WHATSAPP_BOT_AUDIO must be an absolute path"
       [[ -f "$VOICE_BOT_AUDIO" && ! -L "$VOICE_BOT_AUDIO" ]] || fail "WHATSAPP_BOT_AUDIO must be a regular non-symlink file"
     fi
-    [[ "$STATE_DIR" == /* && "$ROOT_DIR" == /* && "$CHROME_PATH" == /* ]] || fail "runtime override paths must be absolute"
-    [[ -x "$CHROME_PATH" ]] || fail "Google Chrome is required at $CHROME_PATH"
+    [[ "$STATE_DIR" == /* && "$ROOT_DIR" == /* ]] || fail "runtime override paths must be absolute"
     if is_loaded && { ! is_owned || ! loaded_is_owned; }; then fail "refusing to replace a loaded foreign LaunchAgent label: ${LABEL}"; fi
     if [[ -f "$PLIST" ]] && ! is_owned; then fail "refusing to overwrite foreign LaunchAgent: $PLIST"; fi
     log "progress" "[0/8] 0% — validating the exact dependency lockfile"
@@ -390,6 +405,7 @@ case "$ACTION" in
     stop_agent
     log "progress" "[2/8] 25% — installing the exact dependency lockfile"
     install_dependencies_transactional || fail "exact dependency installation failed and previous dependencies were restored"
+    resolve_chrome_path
     log "progress" "[3/8] 38% — compiling message Touch ID approval helper"
     mkdir -p "$STATE_DIR"
     chmod 700 "$STATE_DIR"
