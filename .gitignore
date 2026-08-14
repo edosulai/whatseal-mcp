@@ -12,6 +12,9 @@ accounts.json
 # Local runtime and generated artifacts
 .wwebjs_cache/
 web/build/
-graphify-out/cache/
-graphify-out/.graphify_python
+graphify-out/
+
+# Local vendor skills / editor hooks (not product source)
+.claude/
+.codex/
 

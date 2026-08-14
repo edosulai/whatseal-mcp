@@ -89,11 +89,9 @@ function resolveHttpPort(id = null) {
   if (Number.isInteger(fromEnv) && fromEnv >= 1 && fromEnv <= 65535) return fromEnv;
 
   // Port = 30000 + last 4 digits of account id (preserves leading zeros in the label).
-  // Numeric ids map to 30000-39999. Non-numeric ids fall back to 30001.
-  //   account beta → 30001
-  //   account alpha → 30001
-  // Range 30000–39999 is always unprivileged. Override with WHATSAPP_HTTP_PORT.
-  const digits = String(id ?? 'alpha').replace(/\D/g, '') || 'alpha';
+  // Numeric ids map to 30000–39999. Non-numeric ids (e.g. alpha) fall back to 30001.
+  // Override with WHATSAPP_HTTP_PORT.
+  const digits = String(id ?? 'alpha').replace(/\D/g, '') || '0001';
   const last4 = digits.slice(-4).padStart(4, '0');
   return 30000 + Number.parseInt(last4, 10);
 }

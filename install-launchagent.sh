@@ -115,9 +115,8 @@ if [[ -n "$ACCOUNT_ID" ]]; then
 fi
 [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || fail "LaunchAgent label may contain only letters, digits, dot, underscore, and hyphen"
 
-# Port = 30000 + last 4 digits of account id (uses the last 4 digits of the account id):
-#   beta → 30001
-#   alpha → 30001
+# Port = 30000 + last 4 digits of account id.
+# Numeric ids map to 30000–39999. Non-numeric ids (e.g. alpha) fall back to 30001.
 # Explicit WHATSAPP_HTTP_PORT always wins.
 if [[ -z "$HTTP_PORT" ]]; then
   id_for_port="${ACCOUNT_ID:-alpha}"

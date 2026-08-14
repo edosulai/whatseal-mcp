@@ -31,7 +31,7 @@ const ACCOUNTS_PATH = process.env.WHATSEAL_ACCOUNTS_PATH
 function resolveInternalHttpPort(id = null) {
   const fromEnv = Number(process.env.WHATSAPP_HTTP_PORT || 0);
   if (Number.isInteger(fromEnv) && fromEnv >= 1 && fromEnv <= 65535) return fromEnv;
-  const digits = String(id ?? 'alpha').replace(/\D/g, '') || 'alpha';
+  const digits = String(id ?? 'alpha').replace(/\D/g, '') || '0001';
   const last4 = digits.slice(-4).padStart(4, '0');
   return 30000 + Number.parseInt(last4, 10);
 }
@@ -47,7 +47,7 @@ async function loadAccountsConfig() {
     };
   } catch (error) {
     if (error.code === 'ENOENT') {
-      return { default: 'alpha', accounts: [{ id: 'beta', alias: 'alpha', description: '' }] };
+      return { default: 'alpha', accounts: [{ id: 'alpha', alias: 'work', description: '' }] };
     }
     throw error;
   }

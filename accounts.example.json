@@ -4,12 +4,12 @@
     {
       "id": "alpha",
       "alias": "work",
-      "description": "Primary"
+      "description": "Work"
     },
     {
       "id": "beta",
-      "alias": "test",
-      "description": "Secondary"
+      "alias": "personal",
+      "description": "Personal"
     }
   ]
 }

@@ -94,12 +94,12 @@ test('resolveAccountRecord accepts id or alias and rejects unknown accounts', ()
   const config = {
     default: 'alpha',
     accounts: [
-      { id: 'alpha', alias: 'work', description: 'Primary' },
-      { id: 'beta', alias: 'test', description: 'Secondary' },
+      { id: 'alpha', alias: 'work', description: 'Work' },
+      { id: 'beta', alias: 'personal', description: 'Personal' },
     ],
   };
   assert.equal(resolveAccountRecord(config, null).id, 'alpha');
-  assert.equal(resolveAccountRecord(config, 'test').id, 'alpha');
+  assert.equal(resolveAccountRecord(config, 'personal').id, 'beta');
   assert.throws(() => resolveAccountRecord(config, 'missing'), /Unknown account/);
 });
 

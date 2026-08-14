@@ -209,8 +209,10 @@ Every script supports `--verbose` / `-v`.
 
 ### Optional Web UI
 
-The Web UI and gateway are not part of the default daemon attack surface. Enable
-the per-account API explicitly while installing each account, then run the gateway:
+The Web UI and gateway are not part of the default daemon attack surface. The
+`web/` SPA is adapted from [Karen Okonkwo's WhatsApp Web clone](https://github.com/KarenOk/whatsapp-web-clone)
+and is not an official WhatsApp client. Enable the per-account API explicitly
+while installing each account, then run the gateway:
 
 `WHATSEAL_WEB_API=1 ./install-launchagent.sh install --account alpha`
 
