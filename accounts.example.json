@@ -1,0 +1,15 @@
+{
+  "default": "alpha",
+  "accounts": [
+    {
+      "id": "alpha",
+      "alias": "work",
+      "description": "Primary"
+    },
+    {
+      "id": "beta",
+      "alias": "test",
+      "description": "Secondary"
+    }
+  ]
+}

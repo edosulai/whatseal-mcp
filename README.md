@@ -93,6 +93,12 @@ No visible Chrome window is needed. The QR is generated from the headless
 linked-device session and the same isolated profile continues running after the
 pairing completes.
 
+## Accounts
+
+Copy [`accounts.example.json`](./accounts.example.json) to `accounts.json` and
+set the local account ids and aliases. `accounts.json` is gitignored and must
+not be committed.
+
 ## MCP setup (VS Code / Copilot / Claude Desktop)
 
 1. Keep the backend LaunchAgent installed for each account you use.
