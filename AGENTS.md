@@ -34,20 +34,20 @@ Rules:
 
 ## Public repo hygiene
 
-This repo is public. Commits, messages, and git history are visible forever.
+This repo may become public. Commits, commit messages, tags, and git history are visible forever. `.gitignore` only protects the next commit. A clean working tree is not a clean history.
 
-Never commit live identity or generated local state:
-- `accounts.json`, `.env`, QR images, WhatsApp auth/session dirs
-- real phone numbers, live account ids, personal emails, local home paths
-- `graphify-out/`, `.wwebjs_cache/`, `web/build/`, `.claude/`, `.codex/`
+Never commit live identity or machine-local state:
+- secrets, tokens, API keys, `.env`, credentials, session/auth dirs
+- real phone numbers, emails, home paths (`/Users/...`), hostnames, internal URLs
+- generated caches, build output, editor/vendor skill folders, local graphs, logs
 
-Public examples only: ids `alpha` / `beta`, aliases `work` / `personal`, digit fallback `0001`, HTTP fallback `30001`. Copy from `accounts.example.json`. Do not put live ids back into docs, tests, comments, or commit messages.
+Public docs and tests use fake placeholders only. Copy from `*.example` files. Do not put live ids, real names of private accounts, or personal paths back into comments, fixtures, or commit messages.
 
 Before every commit:
 1. Check `git status`. Ignored local files must stay untracked.
-2. Do not stage generate or vendor folders even if they look dirty.
-3. Scan the staged diff for phones, live ids, emails, and absolute home paths.
+2. Do not stage generate, cache, or vendor folders even if they look dirty.
+3. Scan the staged diff for secrets, personal identifiers, and absolute local paths.
 
-`.gitignore` only protects the next commit. A clean working tree does not make old history safe. If a secret already landed in git, say so and wait for an explicit history-rewrite request. Do not force-push on your own.
+If a secret already landed in git, say so and wait for an explicit history-rewrite request. Do not force-push on your own.
 
-Do not start extra WhatsApp accounts or mint a QR unless the user asked. Do not name phone numbers in chat; use the account alias. WhatsApp Chrome is the isolated Puppeteer browser, never the user's personal Google Chrome.
+Do not start extra services, mint pairing/auth artifacts, or touch live user accounts unless the user asked. In chat, use aliases — not raw personal identifiers.
