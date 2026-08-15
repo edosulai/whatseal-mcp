@@ -1817,7 +1817,7 @@ async function executeApprovedAction(draft) {
 }
 
 async function dispatchCore(method, params = {}) {
-  if (method === 'status') {
+  if (method === 'status' || method === 'wake') {
     const lockPower = lockPowerStatusSnapshot();
     const processStatus = processStatusSnapshot();
     return {
@@ -2309,6 +2309,8 @@ async function runBrowserOperation(label, operation) {
 
 async function handleConnection(socket) {
   activeSockets.add(socket);
+  // Idle sockets die quickly. After a request arrives, keep the socket open
+  // long enough for ensureReady (180s) plus the actual WA RPC.
   socket.setTimeout(35000, () => socket.destroy());
   socket.once('close', () => activeSockets.delete(socket));
   // Client disconnects mid-response must not crash the daemon (EPIPE).
@@ -2343,6 +2345,7 @@ async function handleConnection(socket) {
     try {
       const request = JSON.parse(buffer.slice(0, newline));
       log.debug('rpc-request', `method=${request.method || 'missing'}`);
+      socket.setTimeout(methodNeedsBrowser(request.method) ? 210_000 : 35_000);
       const result = await dispatch(request.method, request.params);
       safeEnd(`${JSON.stringify({ id: request.id, ok: true, result })}\n`);
     } catch (error) {

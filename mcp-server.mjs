@@ -12,12 +12,14 @@ import {
   buildReadinessGuidance,
   classifyRpcError,
   createLogger,
+  DEFAULT_RPC_TIMEOUT_MS,
   parseCommonArgs,
   readAccountStatus,
   readJson,
   resolveAccountRecord,
   rpcCall,
 } from './lib/core.mjs';
+import { isIdleColdPhase } from './lib/browser-lifecycle.mjs';
 
 const require = createRequire(import.meta.url);
 const { verbose, help } = parseCommonArgs(process.argv.slice(2));
@@ -30,14 +32,15 @@ const MCP_INSTRUCTIONS = `whatseal-mcp — sealed WhatsApp for local AI agents.
 Before ANY WhatsApp content or send action:
 1. Call whatsapp_list_accounts or whatsapp_doctor (preferred first call in a new chat).
 2. If ready=false, explain userMessage to the user and follow agentNextSteps. Do NOT invent chats/messages.
-3. If code=BACKEND_UNAVAILABLE or BACKEND_STOPPED: ask permission, then have the user run the provided start/install command (or confirm before any shell start).
-4. If code=NEEDS_PAIRING: call whatsapp_qr, show the local PNG path, tell user to scan via WhatsApp → Settings → Linked Devices → Link a Device. Poll whatsapp_wait_ready.
-5. Reads (list/read/search/unread_digest) never need Touch ID and never mark chats as seen.
-6. Sends/replies/reactions/mark-read are two-phase ONLY:
+3. If code=IDLE_COLD: Chrome is down on purpose. Call whatsapp_wait_ready (timeoutSec=180) then retry the read. Do not start extra accounts or scan a QR.
+4. If code=BACKEND_UNAVAILABLE or BACKEND_STOPPED: ask permission, then have the user run the provided start/install command (or confirm before any shell start).
+5. If code=NEEDS_PAIRING: call whatsapp_qr, show the local PNG path, tell user to scan via WhatsApp → Settings → Linked Devices → Link a Device. Poll whatsapp_wait_ready.
+6. Reads (list/read/search/unread_digest) never need Touch ID and never mark chats as seen. The first read after idle_cold wakes Chrome and can take up to ~3 minutes.
+7. Sends/replies/reactions/mark-read are two-phase ONLY:
    prepare_* → show exact target+preview to the user → wait for explicit OK in chat → whatsapp_request_local_approval (Touch ID / macOS password).
    For quote-replies use whatsapp_prepare_reply with the exact message ID from read/search.
-7. On approval timeout or uncertainty: whatsapp_send_outcome first; never re-prepare a duplicate send blindly.
-8. Optional account param accepts id or alias from accounts.json. Omit account to use default.
+8. On approval timeout or uncertainty: whatsapp_send_outcome first; never re-prepare a duplicate send blindly.
+9. Optional account param accepts id or alias from accounts.json. Omit account to use default.
 
 Never claim a message was sent unless request_local_approval / send_outcome reports success.`;
 
@@ -60,7 +63,7 @@ async function resolveAccount(accountParam) {
   return resolveAccountRecord(config, accountParam || null);
 }
 
-async function routedRpcCall(method, params, { timeoutMs = 30000, account = null } = {}) {
+async function routedRpcCall(method, params, { timeoutMs = DEFAULT_RPC_TIMEOUT_MS, account = null } = {}) {
   const { paths: accountPathSet } = await resolveAccount(account);
   return rpcCall(method, params, { timeoutMs, socketPath: accountPathSet.socket });
 }
@@ -132,7 +135,7 @@ const server = new McpServer(
   { instructions: MCP_INSTRUCTIONS },
 );
 
-function register(name, config, method, timeoutMs = 30000) {
+function register(name, config, method, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
   const schema = {
     account: z.string().optional().describe('Account ID or alias. Omit to use the default account.'),
     ...config.inputSchema,
@@ -303,19 +306,20 @@ server.registerTool('whatsapp_qr', {
 });
 
 server.registerTool('whatsapp_wait_ready', {
-  description: 'Poll backend readiness for a short period. Use after starting the service or while the user scans a pairing QR. Returns structured status/guidance on ready, pairing, or timeout.',
+  description: 'Wait until the backend is ready. After idle_cold this wakes Chrome (up to ~3 minutes). Also used after starting the service or while the user scans a pairing QR. Returns structured status/guidance on ready, pairing, lock-pause, or timeout.',
   inputSchema: {
     account: z.string().optional().describe('Account ID or alias. Omit to use the default account.'),
-    timeoutSec: z.number().int().min(1).max(180).default(60).describe('Seconds to wait before returning timeout guidance.'),
+    timeoutSec: z.number().int().min(1).max(180).default(180).describe('Seconds to wait before returning timeout guidance. Default 180 covers a cold Chrome wake.'),
     intervalMs: z.number().int().min(250).max(10000).default(2000).describe('Polling interval in milliseconds.'),
   },
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-}, async ({ account, timeoutSec = 60, intervalMs = 2000 } = {}) => {
+}, async ({ account, timeoutSec = 180, intervalMs = 2000 } = {}) => {
   try {
     const accountMeta = await resolveAccount(account || null);
     const deadline = Date.now() + (timeoutSec * 1000);
     let last = null;
     let attempts = 0;
+    let wakeAttempted = false;
 
     while (Date.now() <= deadline) {
       attempts += 1;
@@ -342,6 +346,42 @@ server.registerTool('whatsapp_wait_ready', {
             ...last.agentNextSteps,
           ],
         });
+      }
+      if (last.phase === 'paused_by_lock' || last.code === 'PAUSED_BY_LOCK') {
+        return response({
+          waited: true,
+          attempts,
+          timedOut: false,
+          ...last,
+        });
+      }
+      const canWake = Boolean(last.canWake)
+        || isIdleColdPhase(last.phase)
+        || last.phase === 'starting'
+        || last.phase === 'resuming_after_lock';
+      if (canWake && !wakeAttempted) {
+        wakeAttempted = true;
+        try {
+          const remainingMs = Math.max(5000, deadline - Date.now());
+          const woken = await routedRpcCall('wake', {}, {
+            timeoutMs: remainingMs,
+            account: account || null,
+          });
+          last = enrichStatus(accountMeta, { source: 'wake', ...woken });
+          if (last.ready) {
+            return response({ waited: true, attempts, timedOut: false, woke: true, ...last });
+          }
+        } catch (error) {
+          last = enrichStatus(
+            accountMeta,
+            await readAccountStatus({
+              accountId: accountMeta.id,
+              pathsForAccount: accountMeta.paths,
+              timeoutMs: 5000,
+            }).catch(() => ({ ready: false, phase: last.phase, error: error.message })),
+          );
+          last.backendError = error.message;
+        }
       }
       if (Date.now() + intervalMs > deadline) break;
       await new Promise((resolve) => setTimeout(resolve, intervalMs));

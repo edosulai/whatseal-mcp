@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   DraftStore,
+  DEFAULT_RPC_TIMEOUT_MS,
   buildReadinessGuidance,
   buildUnreadDigest,
   classifyRpcError,
@@ -170,6 +171,37 @@ test('resolveAccountRecord accepts id or alias and rejects unknown accounts', ()
   assert.throws(() => resolveAccountRecord(config, 'missing'), /Unknown account/);
 });
 
+test('default RPC timeout covers a cold Chrome wake', () => {
+  assert.equal(DEFAULT_RPC_TIMEOUT_MS, 180_000);
+});
+
+test('readiness guidance for idle_cold tells agents to wait, not re-pair', () => {
+  const guidance = buildReadinessGuidance({
+    accountId: 'alpha',
+    alias: 'work',
+    phase: 'idle_cold',
+    ready: false,
+    projectRoot: '/tmp/whatseal-mcp',
+  });
+  assert.equal(guidance.ready, false);
+  assert.equal(guidance.code, 'IDLE_COLD');
+  assert.match(guidance.userMessage, /idle/i);
+  assert.ok(guidance.agentNextSteps.some((step) => /wait_ready/i.test(step)));
+  assert.ok(guidance.agentNextSteps.every((step) => !/start extra accounts|scan a new QR/i.test(step) || /Do not start extra accounts/i.test(step)));
+});
+
+test('readiness guidance for paused_by_lock asks to unlock', () => {
+  const guidance = buildReadinessGuidance({
+    accountId: 'alpha',
+    alias: 'work',
+    phase: 'paused_by_lock',
+    ready: false,
+    projectRoot: '/tmp/whatseal-mcp',
+  });
+  assert.equal(guidance.code, 'PAUSED_BY_LOCK');
+  assert.match(guidance.userMessage, /paused_by_lock|locked/i);
+});
+
 test('readiness guidance for stopped backend is actionable', () => {
   const guidance = buildReadinessGuidance({
     accountId: 'alpha',
@@ -200,4 +232,23 @@ test('classifyRpcError maps not-ready and socket failures', () => {
   );
   assert.equal(unavailable.code, 'BACKEND_UNAVAILABLE');
   assert.match(unavailable.commands.install, /install-launchagent\.sh install --account alpha/);
+
+  const closedWhileCold = classifyRpcError(
+    new Error('WhatsApp backend closed the connection without a response.'),
+    { accountId: 'alpha', alias: 'work', projectRoot: '/tmp/whatseal-mcp', savedState: { phase: 'idle_cold' } },
+  );
+  assert.equal(closedWhileCold.code, 'IDLE_COLD');
+  assert.ok(closedWhileCold.agentNextSteps.some((step) => /wait_ready/i.test(step)));
+
+  const timeoutWhileCold = classifyRpcError(
+    new Error('Backend request timed out after 180000 ms.'),
+    { accountId: 'alpha', alias: 'work', projectRoot: '/tmp/whatseal-mcp', savedState: { phase: 'idle_cold' } },
+  );
+  assert.equal(timeoutWhileCold.code, 'IDLE_COLD');
+
+  const lockPause = classifyRpcError(
+    new Error('WhatsApp backend is paused_by_lock (screen locked or lid closed). Unlock/open lid to resume.'),
+    { accountId: 'alpha', alias: 'work', projectRoot: '/tmp/whatseal-mcp' },
+  );
+  assert.equal(lockPause.code, 'PAUSED_BY_LOCK');
 });

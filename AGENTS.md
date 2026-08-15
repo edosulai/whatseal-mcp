@@ -27,6 +27,7 @@ Rules:
   - Status: `chromeAlive`, `browserPolicy`, `idleChromeMs`, `idleForMs`, `lastRpcAt`
   - Cold phase: `idle_cold` (legacy readers may still see aliases)
 - Node + Unix control socket stay up; Chrome is destroyed on idle and recreated on next WA RPC (`ensureBrowser` / `ensureReady`).
+- `idle_cold` is not a stopped backend. First WA RPC after idle can take up to ~3 minutes. Use `whatsapp_wait_ready` / `node cli.mjs wait-ready` — do not start extra accounts or scan a new QR.
 - `paused_by_lock` always wins over `idle_cold`. No caffeinate / prevent-sleep.
 - Soft documentation cap: `MAX_HOT_BROWSERS=1`. Do not multi-profile one Chromium as the first step.
 - Health poll while warm: ~90s. Auto-accept / call-bot OFF by default. Stop unused accounts instead of leaving warm Chrome.

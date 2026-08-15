@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import {
   accountPaths,
   createLogger,
+  DEFAULT_RPC_TIMEOUT_MS,
   parseCommonArgs,
   readJson,
   resolveAccountRecord,
@@ -25,6 +26,7 @@ function usage() {
 
 Commands:
   status
+  wait-ready [--timeout-sec N]
   compatibility
   compatibility-self-test
   security-audit
@@ -54,7 +56,7 @@ function option(name, fallback = null) {
 
 function positional() {
   const result = [];
-  const optionsWithValues = new Set(['--limit', '--chat', '--account', '--since']);
+  const optionsWithValues = new Set(['--limit', '--chat', '--account', '--since', '--timeout-sec']);
   for (let index = 1; index < args.length; index += 1) {
     const value = args[index];
     if (optionsWithValues.has(value)) {
@@ -108,6 +110,13 @@ async function main() {
         error: error.message,
       };
     }
+  } else if (command === 'wait-ready') {
+    const timeoutSec = Number(option('--timeout-sec', 180));
+    const timeoutMs = Number.isFinite(timeoutSec) && timeoutSec > 0
+      ? Math.min(180, Math.max(1, Math.floor(timeoutSec))) * 1000
+      : DEFAULT_RPC_TIMEOUT_MS;
+    result = await rpc('wake', {}, { timeoutMs });
+    result = { account: accountMeta.id, alias: accountMeta.record?.alias || null, ...result };
   } else if (command === 'compatibility') {
     result = await rpc('compatibility', {}, { timeoutMs: 5000 });
   } else if (command === 'compatibility-self-test') {

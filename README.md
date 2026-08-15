@@ -131,15 +131,19 @@ The MCP process only speaks stdio tools. It does **not** auto-start Chrome.
 If the backend is stopped or unpaired, tools return structured guidance
 (`code`, `userMessage`, `agentNextSteps`, exact shell commands) so other chat
 sessions can tell the user to start/pair instead of failing opaquely.
+`idle_cold` is not stopped: the control socket is up and the next WhatsApp read
+wakes Chrome (up to ~3 minutes). Use `whatsapp_wait_ready` (`timeoutSec=180`)
+or `node cli.mjs wait-ready` instead of starting another account.
 
 ### Agent workflow expected by server instructions
 
 1. First call: `whatsapp_doctor` or `whatsapp_list_accounts`
-2. If not ready: follow returned `userMessage` / start or pair steps
-3. If pairing: `whatsapp_qr` → user scans Linked Devices → `whatsapp_wait_ready`
-4. Reads: free (`whatsapp_unread_digest`, `whatsapp_list_chats`, `whatsapp_read_messages`, …)
-5. Sends/replies: `prepare_*` → show exact preview → user OK in chat → `whatsapp_request_local_approval`
-6. Approval timeout: `whatsapp_send_outcome` (never blind re-prepare)
+2. If `code=IDLE_COLD`: `whatsapp_wait_ready` (`timeoutSec=180`) then retry the read
+3. If stopped/unpaired: follow returned `userMessage` / start or pair steps
+4. If pairing: `whatsapp_qr` → user scans Linked Devices → `whatsapp_wait_ready`
+5. Reads: free (`whatsapp_unread_digest`, `whatsapp_list_chats`, `whatsapp_read_messages`, …)
+6. Sends/replies: `prepare_*` → show exact preview → user OK in chat → `whatsapp_request_local_approval`
+7. Approval timeout: `whatsapp_send_outcome` (never blind re-prepare)
 
 ## Agent tools
 
@@ -204,6 +208,7 @@ Every script supports `--verbose` / `-v`.
 
 - Status: `./install-launchagent.sh status`
 - Live status (includes `paused_by_lock` / `lockPower` / `chromeAlive` / `idleChromeMs`): `node cli.mjs status --account alpha`
+- Wake Chrome after `idle_cold` (up to ~3 minutes): `node cli.mjs wait-ready --account alpha`
 - Version report: `node cli.mjs compatibility`
 - Content-free upgrade test: `node cli.mjs compatibility-self-test`
 - Approve a reviewed machine-local tuple: `node approve-baseline.mjs --approve-current`
@@ -260,7 +265,7 @@ resume without manual stop/start.
 
 | Policy | Behavior |
 | --- | --- |
-| `idle` (default) | Warm-start Chrome after unlock; close it after `IDLE_CHROME_MS` with no WA RPC; next RPC wakes |
+| `idle` (default) | Warm-start Chrome after unlock; close it after `IDLE_CHROME_MS` with no WA RPC; next WA RPC / `wait-ready` wakes (up to ~3 minutes) |
 | `always` | Keep Chrome hot while unlocked (highest memory) |
 | `on_demand` | Do not open Chrome on boot/unlock; open only on first WA RPC |
 
