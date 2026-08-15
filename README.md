@@ -137,8 +137,8 @@ sessions can tell the user to start/pair instead of failing opaquely.
 1. First call: `whatsapp_doctor` or `whatsapp_list_accounts`
 2. If not ready: follow returned `userMessage` / start or pair steps
 3. If pairing: `whatsapp_qr` → user scans Linked Devices → `whatsapp_wait_ready`
-4. Reads: free (`whatsapp_list_chats`, `whatsapp_read_messages`, …)
-5. Sends: `prepare_*` → show exact preview → user OK in chat → `whatsapp_request_local_approval`
+4. Reads: free (`whatsapp_unread_digest`, `whatsapp_list_chats`, `whatsapp_read_messages`, …)
+5. Sends/replies: `prepare_*` → show exact preview → user OK in chat → `whatsapp_request_local_approval`
 6. Approval timeout: `whatsapp_send_outcome` (never blind re-prepare)
 
 ## Agent tools
@@ -156,6 +156,7 @@ sessions can tell the user to start/pair instead of failing opaquely.
 - `whatsapp_security_audit`
 
 ### Read
+- `whatsapp_unread_digest`
 - `whatsapp_list_chats`
 - `whatsapp_read_messages`
 - `whatsapp_search_messages`
@@ -163,6 +164,7 @@ sessions can tell the user to start/pair instead of failing opaquely.
 
 ### Write (two-phase + Touch ID)
 - `whatsapp_prepare_send`
+- `whatsapp_prepare_reply`
 - `whatsapp_prepare_rich_test`
 - `whatsapp_prepare_mark_read`
 - `whatsapp_prepare_reaction`
@@ -171,18 +173,22 @@ sessions can tell the user to start/pair instead of failing opaquely.
 
 Every tool accepts optional `account` (id or alias from `accounts.json`).
 
-Chat listing omits last-message previews by default. Reading is intended not to
-mark chats as seen. Sending passes `sendSeen: false`, reconciles missing library
-return objects against the recent outbound cache, and returns presence to
-unavailable. Rich E2E tests generate deterministic assets in memory and do not
-read arbitrary user files or address-book contacts. Mark-read and reactions
-require the same immutable native authorization. WhatsApp Web is an unofficial
-and evolving surface, so verify this behavior after dependency or WhatsApp updates.
+`whatsapp_unread_digest` is the inbox watch: unread chats, optional last-message
+previews, and a `nextSince` cursor. It never marks chats as seen. Chat listing
+still omits last-message previews by default. `whatsapp_read_messages` now
+includes quoted-message id/body when present. Quote-replies use
+`whatsapp_prepare_reply` with that exact message ID, then the same Touch ID
+path. Sending passes `sendSeen: false`, reconciles missing library return
+objects against the recent outbound cache, and returns presence to unavailable.
+Rich E2E tests generate deterministic assets in memory and do not read arbitrary
+user files or address-book contacts. Mark-read and reactions require the same
+immutable native authorization. WhatsApp Web is an unofficial and evolving
+surface, so verify this behavior after dependency or WhatsApp updates.
 
 ## Security Model
 
 - Touch ID (or macOS login password) is required for every externally visible action:
-  send, reaction, and mark-read.
+  send, quote-reply, reaction, and mark-read.
 - Rate limiting: 20 messages/hour, 100 messages/day, 3-second cooldown.
 - No chat history stored locally.
 - No TCP listener by default; Unix socket with mode 0600.

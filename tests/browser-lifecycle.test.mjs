@@ -147,8 +147,10 @@ test('status snapshot uses instaseal contract fields', () => {
   assert.equal(methodNeedsBrowser('compatibility'), false);
   assert.equal(methodNeedsBrowser('compatibilitySelfTest'), true);
   assert.equal(methodNeedsBrowser('listChats'), true);
+  assert.equal(methodNeedsBrowser('unreadDigest'), true);
   assert.equal(methodNeedsBrowser('getSendOutcome'), false);
   assert.equal(methodNeedsBrowser('prepareSend'), true);
+  assert.equal(methodNeedsBrowser('prepareReply'), true);
   assert.equal(isIdleColdPhase('idle_cold'), true);
   assert.equal(isIdleColdPhase('idle_no_browser'), true);
   assert.equal(isIdleColdPhase('ready'), false);

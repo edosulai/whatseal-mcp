@@ -19,6 +19,7 @@ import {
   accountPaths,
   createLogger,
   DraftStore,
+  buildUnreadDigest,
   ensurePrivateDirectories,
   parseCommonArgs,
   readJson,
@@ -1053,12 +1054,36 @@ async function getMessagesDirect(chatId, limit) {
       if (typeof value === 'string') return value;
       return value._serialized ?? value.$1 ?? '';
     };
+    const toQuoted = (message) => {
+      if (!message.quotedStanzaID && !message.quotedMsg) return null;
+      try {
+        const quoted = window.require('WAWebQuotedMsgModelUtils').getQuotedMsgObj(message);
+        if (!quoted) return null;
+        const quotedType = quoted.type || 'unknown';
+        const quotedMedia = Boolean(quoted.mediaData || quoted.isMedia)
+          || ['image', 'video', 'audio', 'ptt', 'sticker', 'document'].includes(quotedType);
+        return {
+          id: serialized(quoted.id),
+          body: String(quotedMedia ? (quoted.caption || quoted.filename || '') : (quoted.body || quoted.caption || '')).slice(0, 400),
+          type: quotedType,
+          fromMe: Boolean(quoted.id?.fromMe),
+        };
+      } catch {
+        return {
+          id: serialized(message.quotedStanzaID) || '',
+          body: String(message.quotedMsg?.body || message.quotedMsg?.caption || '').slice(0, 400),
+          type: message.quotedMsg?.type || 'unknown',
+          fromMe: Boolean(message.quotedMsg?.id?.fromMe),
+        };
+      }
+    };
     const toMessage = (message) => {
       const type = message.type || 'unknown';
       const mediaLike = Boolean(message.mediaData || message.isMedia) || ['image', 'video', 'audio', 'ptt', 'sticker', 'document'].includes(type);
       const body = mediaLike
         ? String(message.caption || message.filename || '').slice(0, 12000)
         : String(message.body || message.caption || '').slice(0, 12000);
+      const quoted = toQuoted(message);
       return {
         id: serialized(message.id),
         chatId: serialized(message.id?.remote) || serialized(message.from),
@@ -1071,7 +1096,8 @@ async function getMessagesDirect(chatId, limit) {
         type,
         body,
         hasMedia: mediaLike,
-        hasQuotedMessage: Boolean(message.quotedStanzaID || message.quotedMsg),
+        hasQuotedMessage: Boolean(quoted || message.quotedStanzaID || message.quotedMsg),
+        quoted,
       };
     };
     const chat = await window.WWebJS.getChat(target, { getAsModel: false });
@@ -1169,19 +1195,43 @@ async function searchMessagesDirect(query, chatId, limit) {
     const { messages } = await window
       .require('WAWebCollections')
       .Msg.search(text, undefined, maximum, target || undefined);
-    return messages.map((message) => ({
-      id: serialized(message.id),
-      chatId: serialized(message.id?.remote) || serialized(message.from),
-      fromMe: Boolean(message.id?.fromMe),
-      from: serialized(message.from),
-      to: serialized(message.to),
-      author: serialized(message.author) || null,
-      timestamp: Number(message.t || 0),
-      type: message.type || 'unknown',
-      body: String(message.body || message.caption || '').slice(0, 12000),
-      hasMedia: Boolean(message.mediaData || message.isMedia),
-      hasQuotedMessage: Boolean(message.quotedStanzaID || message.quotedMsg),
-    }));
+    return messages.map((message) => {
+      let quoted = null;
+      if (message.quotedStanzaID || message.quotedMsg) {
+        try {
+          const quotedObj = window.require('WAWebQuotedMsgModelUtils').getQuotedMsgObj(message);
+          if (quotedObj) {
+            quoted = {
+              id: serialized(quotedObj.id),
+              body: String(quotedObj.body || quotedObj.caption || '').slice(0, 400),
+              type: quotedObj.type || 'unknown',
+              fromMe: Boolean(quotedObj.id?.fromMe),
+            };
+          }
+        } catch {
+          quoted = {
+            id: serialized(message.quotedStanzaID) || '',
+            body: String(message.quotedMsg?.body || message.quotedMsg?.caption || '').slice(0, 400),
+            type: message.quotedMsg?.type || 'unknown',
+            fromMe: Boolean(message.quotedMsg?.id?.fromMe),
+          };
+        }
+      }
+      return {
+        id: serialized(message.id),
+        chatId: serialized(message.id?.remote) || serialized(message.from),
+        fromMe: Boolean(message.id?.fromMe),
+        from: serialized(message.from),
+        to: serialized(message.to),
+        author: serialized(message.author) || null,
+        timestamp: Number(message.t || 0),
+        type: message.type || 'unknown',
+        body: String(message.body || message.caption || '').slice(0, 12000),
+        hasMedia: Boolean(message.mediaData || message.isMedia),
+        hasQuotedMessage: Boolean(quoted || message.quotedStanzaID || message.quotedMsg),
+        quoted,
+      };
+    });
   }, query, chatId, limit);
 }
 
@@ -1683,26 +1733,43 @@ async function requestNativeApproval(draft) {
   });
 }
 
-async function executeApprovedAction(draft) {
+async function sendApprovedText(draft, options = {}) {
   const startedAt = Date.now();
+  const sent = await client.sendMessage(draft.chatId, draft.payload?.text || draft.text, {
+    sendSeen: false,
+    waitUntilMsgSent: true,
+    ignoreQuoteErrors: false,
+    ...options,
+  });
+  await client.sendPresenceUnavailable().catch(() => {});
+  const outboundBody = draft.payload?.text || draft.text;
+  const verified = sent
+    ? {
+        id: sent.id?._serialized || '',
+        timestamp: Number(sent.timestamp || 0),
+        ack: Number(sent.ack ?? 0),
+        ackLabel: ackLabel(Number(sent.ack ?? 0)),
+        type: sent.type || 'chat',
+      }
+    : await verifyRecentOutbound(draft.chatId, { startedAt, body: outboundBody, expectedTypes: ['chat'] });
+  return verified
+    ? { state: 'sent', action: draft.action, message: verified }
+    : { state: 'outcome-unknown', action: draft.action, detail: 'WhatsApp returned no message object and the exact outbound text was not found in the recent chat cache.' };
+}
+
+async function executeApprovedAction(draft) {
   if (draft.action === 'send-text') {
-    const sent = await client.sendMessage(draft.chatId, draft.text, {
-      sendSeen: false,
-      waitUntilMsgSent: true,
-    });
-    await client.sendPresenceUnavailable().catch(() => {});
-    const verified = sent
-      ? {
-          id: sent.id?._serialized || '',
-          timestamp: Number(sent.timestamp || 0),
-          ack: Number(sent.ack ?? 0),
-          ackLabel: ackLabel(Number(sent.ack ?? 0)),
-          type: sent.type || 'chat',
-        }
-      : await verifyRecentOutbound(draft.chatId, { startedAt, body: draft.text, expectedTypes: ['chat'] });
-    return verified
-      ? { state: 'sent', action: draft.action, message: verified }
-      : { state: 'outcome-unknown', action: draft.action, detail: 'WhatsApp returned no message object and the exact outbound text was not found in the recent chat cache.' };
+    return await sendApprovedText(draft);
+  }
+
+  if (draft.action === 'send-reply') {
+    const quotedMessageId = String(draft.payload?.quotedMessageId || '').trim();
+    if (!quotedMessageId) throw new Error('Approved reply is missing the quoted message ID.');
+    const quoted = await getMessageStatusDirect(quotedMessageId);
+    if (quoted.chatId !== draft.chatId) {
+      throw new Error('The approved quoted message no longer belongs to the approved chat.');
+    }
+    return await sendApprovedText(draft, { quotedMessageId });
   }
 
   if (draft.action === 'send-rich') {
@@ -1710,6 +1777,7 @@ async function executeApprovedAction(draft) {
     if (specification.sha256 !== draft.payload?.sha256) {
       throw new Error('Synthetic asset attestation changed after preparation.');
     }
+    const startedAt = Date.now();
     const sent = await client.sendMessage(draft.chatId, specification.content(), {
       ...specification.options,
       sendSeen: false,
@@ -1992,6 +2060,16 @@ async function dispatchCore(method, params = {}) {
     return chats.slice(0, limit);
   }
 
+  if (method === 'unreadDigest') {
+    const limit = Math.min(Math.max(Number(params.limit || 20), 1), 200);
+    const includePreview = params.includePreview !== false;
+    const includeArchived = params.includeArchived !== false;
+    const since = Number(params.since || 0);
+    let chats = await getChatSummaries({ includeLastMessage: includePreview });
+    if (!includeArchived) chats = chats.filter((chat) => !chat.archived);
+    return buildUnreadDigest(chats, { limit, includePreview, since });
+  }
+
   if (method === 'getMessages') {
     const chat = await resolveChat(params.chat);
     const limit = Math.min(Math.max(Number(params.limit || 30), 1), 200);
@@ -2114,6 +2192,48 @@ async function dispatchCore(method, params = {}) {
       preview,
       expiresAt: new Date(prepared.expiresAt).toISOString(),
       warning: 'No reaction has been sent. Show this exact preview to the user and wait for explicit approval before requesting Touch ID.',
+    };
+  }
+
+  if (method === 'prepareReply') {
+    assertSendRateLimit();
+    const text = String(params.text || '').trim();
+    if (!text) throw new Error('Reply text cannot be empty.');
+    if (text.length > 10000) throw new Error('Reply text exceeds the 10,000-character safety limit.');
+    const chat = await resolveChat(params.chat);
+    const messageId = String(params.messageId || params.quotedMessageId || '').trim();
+    if (!messageId) throw new Error('A quoted message ID is required.');
+    const message = await getMessageStatusDirect(messageId);
+    if (message.chatId !== chat.id) throw new Error('The message ID does not belong to the selected chat.');
+    const quotedBody = message.body ? `\nQuoted preview: ${truncateText(message.body, 300)}` : '';
+    const preview = `Reply to the exact WhatsApp message ID below.\nMessage ID: ${message.id}\nDirection: ${message.fromMe ? 'outbound' : 'incoming'}${quotedBody}\n\nReply text:\n${text}`;
+    const prepared = drafts.prepare({
+      chatId: chat.id,
+      chatName: chat.name || '',
+      text: preview,
+      action: 'send-reply',
+      payload: { messageId: message.id, quotedMessageId: message.id, text },
+    });
+    await recordOutcome(prepared.approvalId, {
+      state: 'prepared',
+      action: prepared.action,
+      messageId: message.id,
+      characters: text.length,
+    });
+    return {
+      approvalId: prepared.approvalId,
+      action: prepared.action,
+      target: { id: prepared.chatId, name: prepared.chatName },
+      quoted: {
+        id: message.id,
+        fromMe: Boolean(message.fromMe),
+        type: message.type || 'unknown',
+        body: truncateText(message.body || '', 300),
+      },
+      text,
+      preview,
+      expiresAt: new Date(prepared.expiresAt).toISOString(),
+      warning: 'Nothing has been sent. Show this exact quoted target and reply text to the user, wait for explicit approval, then request the immutable native Touch ID approval.',
     };
   }
 

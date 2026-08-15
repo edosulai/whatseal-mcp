@@ -32,9 +32,10 @@ Before ANY WhatsApp content or send action:
 2. If ready=false, explain userMessage to the user and follow agentNextSteps. Do NOT invent chats/messages.
 3. If code=BACKEND_UNAVAILABLE or BACKEND_STOPPED: ask permission, then have the user run the provided start/install command (or confirm before any shell start).
 4. If code=NEEDS_PAIRING: call whatsapp_qr, show the local PNG path, tell user to scan via WhatsApp → Settings → Linked Devices → Link a Device. Poll whatsapp_wait_ready.
-5. Reads (list/read/search) never need Touch ID.
-6. Sends/reactions/mark-read are two-phase ONLY:
+5. Reads (list/read/search/unread_digest) never need Touch ID and never mark chats as seen.
+6. Sends/replies/reactions/mark-read are two-phase ONLY:
    prepare_* → show exact target+preview to the user → wait for explicit OK in chat → whatsapp_request_local_approval (Touch ID / macOS password).
+   For quote-replies use whatsapp_prepare_reply with the exact message ID from read/search.
 7. On approval timeout or uncertainty: whatsapp_send_outcome first; never re-prepare a duplicate send blindly.
 8. Optional account param accepts id or alias from accounts.json. Omit account to use default.
 
@@ -392,6 +393,17 @@ register('whatsapp_list_chats', {
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, 'listChats');
 
+register('whatsapp_unread_digest', {
+  description: 'Read-only unread inbox digest. Returns unread chat counts, optional last-message previews, and a nextSince cursor for later polls. Never marks chats as seen. Prefer this over listing then re-reading every chat when the user asks what is new.',
+  inputSchema: {
+    limit: z.number().int().min(1).max(200).default(20),
+    includePreview: z.boolean().default(true).describe('Include short last-message previews. Set false to return counts only.'),
+    includeArchived: z.boolean().default(true),
+    since: z.number().int().min(0).optional().describe('Optional WhatsApp chat timestamp cursor from a previous digest.nextSince. Only chats newer than this are returned.'),
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+}, 'unreadDigest');
+
 register('whatsapp_read_messages', {
   description: 'Read recent messages from one WhatsApp chat by chat ID or exact unique name. Media is never downloaded. Reading does not intentionally mark the chat as seen. If not authenticated/ready, returns structured guidance instead of content.',
   inputSchema: {
@@ -454,6 +466,16 @@ register('whatsapp_prepare_send', {
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
 }, 'prepareSend');
 
+register('whatsapp_prepare_reply', {
+  description: 'Prepare a quote-reply to one exact WhatsApp message without sending it. Show the quoted message ID, quoted preview, and reply text to the user, then wait for explicit approval before requesting the native Touch ID dialog.',
+  inputSchema: {
+    chat: z.string().min(1).describe('Chat ID or exact unique chat name.'),
+    messageId: z.string().min(1).describe('Exact quoted message ID from whatsapp_read_messages or whatsapp_search_messages.'),
+    text: z.string().min(1).max(10000),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+}, 'prepareReply');
+
 register('whatsapp_prepare_rich_test', {
   description: 'Prepare one deterministic synthetic E2E asset without sending it. Supported kinds are image, document, location, contact, and sticker. No user files, address book entries, or private locations are read. Show the exact preview and SHA-256 to the user before requesting local approval.',
   inputSchema: {
@@ -482,7 +504,7 @@ register('whatsapp_prepare_reaction', {
 }, 'prepareReaction');
 
 register('whatsapp_request_local_approval', {
-  description: 'EXTERNALLY VISIBLE ACTION: opens a native macOS dialog containing the immutable target, action type, and exact prepared preview. The prepared send, reaction, or mark-read action executes only after direct Touch ID or macOS login-password authorization. Call only after showing the preview and receiving explicit approval to open the dialog.',
+  description: 'EXTERNALLY VISIBLE ACTION: opens a native macOS dialog containing the immutable target, action type, and exact prepared preview. The prepared send, quote-reply, reaction, or mark-read action executes only after direct Touch ID or macOS login-password authorization. Call only after showing the preview and receiving explicit approval to open the dialog.',
   inputSchema: {
     approvalId: z.string().uuid(),
   },
@@ -501,7 +523,7 @@ async function main() {
   log.info('start', 'transport=stdio');
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log.info('ready', 'tools=20');
+  log.info('ready', 'tools=22');
 }
 
 main().catch((error) => {

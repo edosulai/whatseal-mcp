@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   DraftStore,
   buildReadinessGuidance,
+  buildUnreadDigest,
   classifyRpcError,
   resolveAccountRecord,
   serializeChat,
@@ -46,7 +47,73 @@ test('serializeMessage excludes raw message objects and media bytes', () => {
   });
   assert.equal(result.id, 'message-id');
   assert.equal(result.hasMedia, true);
+  assert.equal(result.quoted, null);
   assert.equal('data' in result, false);
+});
+
+test('serializeMessage exposes quoted id and truncated body only', () => {
+  const result = serializeMessage({
+    id: { _serialized: 'reply-id', remote: '123@c.us' },
+    body: 'reply',
+    fromMe: true,
+    from: 'me@c.us',
+    timestamp: 200,
+    type: 'chat',
+    hasQuotedMsg: true,
+    quoted: {
+      id: { _serialized: 'quoted-id' },
+      body: 'x'.repeat(500),
+      type: 'chat',
+      fromMe: false,
+    },
+  });
+  assert.equal(result.hasQuotedMessage, true);
+  assert.equal(result.quoted.id, 'quoted-id');
+  assert.equal(result.quoted.fromMe, false);
+  assert.ok(result.quoted.body.endsWith('…'));
+  assert.ok(result.quoted.body.length <= 401);
+});
+
+test('unread digest is read-only, ranked, and cursor-aware', () => {
+  const chats = [
+    { id: 'old@c.us', name: 'Old', unreadCount: 1, timestamp: 10, lastMessage: { body: 'old' } },
+    { id: 'zero@c.us', name: 'Zero', unreadCount: 0, timestamp: 50, lastMessage: { body: 'seen' } },
+    { id: 'fresh@c.us', name: 'Fresh', unreadCount: 3, timestamp: 40, muted: true, lastMessage: { body: 'new' } },
+    { id: 'mid@c.us', name: 'Mid', unreadCount: 2, timestamp: 20, lastMessage: { body: 'mid' } },
+  ];
+  const digest = buildUnreadDigest(chats, { limit: 2, now: () => '2026-01-01T00:00:00.000Z' });
+  assert.equal(digest.markRead, false);
+  assert.equal(digest.totalUnreadChats, 3);
+  assert.equal(digest.totalUnreadMessages, 6);
+  assert.equal(digest.truncated, true);
+  assert.equal(digest.nextSince, 40);
+  assert.deepEqual(digest.chats.map((chat) => chat.id), ['fresh@c.us', 'mid@c.us']);
+  assert.equal(digest.chats[0].lastMessage.body, 'new');
+
+  const countsOnly = buildUnreadDigest(chats, { includePreview: false, now: () => 't' });
+  assert.equal('lastMessage' in countsOnly.chats[0], false);
+
+  const incremental = buildUnreadDigest(chats, { since: 20, now: () => 't' });
+  assert.deepEqual(incremental.chats.map((chat) => chat.id), ['fresh@c.us']);
+});
+
+test('quote-reply drafts bind the quoted message id separately from the Touch ID preview', () => {
+  const store = new DraftStore();
+  const payload = { quotedMessageId: 'quoted-1', text: 'Got it' };
+  const draft = store.prepare({
+    chatId: '123@c.us',
+    chatName: 'Example',
+    text: 'Reply to quoted-1\nGot it',
+    action: 'send-reply',
+    payload,
+  });
+  payload.text = 'mutated';
+  draft.payload.quotedMessageId = 'wrong';
+  const awaiting = store.beginApproval(draft.approvalId);
+  assert.equal(awaiting.action, 'send-reply');
+  assert.deepEqual(awaiting.payload, { quotedMessageId: 'quoted-1', text: 'Got it' });
+  assert.notEqual(awaiting.text, awaiting.payload.text);
+  assert.deepEqual(store.consumeApproved(draft.approvalId).payload, { quotedMessageId: 'quoted-1', text: 'Got it' });
 });
 
 test('draft approval is exact, expiring, and single-use', () => {

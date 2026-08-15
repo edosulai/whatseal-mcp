@@ -30,10 +30,12 @@ Commands:
   security-audit
   qr
   chats [--limit N] [--unread] [--include-preview]
+  digest [--limit N] [--no-preview] [--since TS]
   messages <chat-id-or-exact-name> [--limit N]
   search <query> [--chat ID_OR_NAME] [--limit N]
   message-status <message-id>
   prepare-send <chat-id-or-exact-name> <text>
+  prepare-reply <chat-id-or-exact-name> <message-id> <text>
   prepare-rich-test <chat-id-or-exact-name> <image|document|location|contact|sticker>
   prepare-mark-read <chat-id-or-exact-name>
   prepare-reaction <chat-id-or-exact-name> <message-id> <emoji>
@@ -41,7 +43,7 @@ Commands:
   send-outcome <approval-id>
 
 request-approval opens an immutable native preview and requires Touch ID or the
-macOS login password before an externally visible send, reaction, or mark-read action.
+macOS login password before an externally visible send, quote-reply, reaction, or mark-read action.
 `);
 }
 
@@ -52,7 +54,7 @@ function option(name, fallback = null) {
 
 function positional() {
   const result = [];
-  const optionsWithValues = new Set(['--limit', '--chat', '--account']);
+  const optionsWithValues = new Set(['--limit', '--chat', '--account', '--since']);
   for (let index = 1; index < args.length; index += 1) {
     const value = args[index];
     if (optionsWithValues.has(value)) {
@@ -135,6 +137,13 @@ async function main() {
       includeArchived: true,
       includeLastMessage: args.includes('--include-preview'),
     });
+  } else if (command === 'digest') {
+    result = await rpc('unreadDigest', {
+      limit: Number(option('--limit', 20)),
+      includePreview: !args.includes('--no-preview'),
+      includeArchived: true,
+      since: Number(option('--since', 0)),
+    });
   } else if (command === 'messages') {
     const [chat] = positional();
     if (!chat) throw new Error('messages requires a chat ID or exact chat name.');
@@ -155,6 +164,10 @@ async function main() {
     const [chat, text] = positional();
     if (!chat || !text) throw new Error('prepare-send requires a chat and quoted message text.');
     result = await rpc('prepareSend', { chat, text });
+  } else if (command === 'prepare-reply') {
+    const [chat, messageId, text] = positional();
+    if (!chat || !messageId || !text) throw new Error('prepare-reply requires a chat, message ID, and reply text.');
+    result = await rpc('prepareReply', { chat, messageId, text });
   } else if (command === 'prepare-rich-test') {
     const [chat, kind] = positional();
     if (!chat || !kind) throw new Error('prepare-rich-test requires a chat and asset kind.');
