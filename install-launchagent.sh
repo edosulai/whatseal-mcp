@@ -69,7 +69,7 @@ usage() {
   cat <<'EOF'
 Usage: install-launchagent.sh [install|status|start|stop|restart|remove] [--account ID] [--verbose|-v]
 
-  install   Install dependencies, render the private LaunchAgent, and start it.
+  install   Install dependencies, render the private LaunchAgent, start it, and copy the agent skill.
   status    Show launchd, socket, and pairing status without reading messages.
   start     Start an already installed agent.
   stop      Stop an already installed agent.
@@ -398,32 +398,36 @@ case "$ACTION" in
     [[ "$STATE_DIR" == /* && "$ROOT_DIR" == /* ]] || fail "runtime override paths must be absolute"
     if is_loaded && { ! is_owned || ! loaded_is_owned; }; then fail "refusing to replace a loaded foreign LaunchAgent label: ${LABEL}"; fi
     if [[ -f "$PLIST" ]] && ! is_owned; then fail "refusing to overwrite foreign LaunchAgent: $PLIST"; fi
-    log "progress" "[0/8] 0% — validating the exact dependency lockfile"
+    log "progress" "[0/9] 0% — validating the exact dependency lockfile"
     run env PUPPETEER_SKIP_DOWNLOAD=true "$NPM_BIN" ci --prefix "$SCRIPT_DIR" --omit=dev --ignore-scripts --no-audit --no-fund --dry-run
-    log "progress" "[1/8] 12% — stopping the previous owned instance"
+    log "progress" "[1/9] 11% — stopping the previous owned instance"
     stop_agent
-    log "progress" "[2/8] 25% — installing the exact dependency lockfile"
+    log "progress" "[2/9] 22% — installing the exact dependency lockfile"
     install_dependencies_transactional || fail "exact dependency installation failed and previous dependencies were restored"
     resolve_chrome_path
-    log "progress" "[3/8] 38% — compiling message Touch ID approval helper"
+    log "progress" "[3/9] 33% — compiling message Touch ID approval helper"
     mkdir -p "$STATE_DIR"
     chmod 700 "$STATE_DIR"
     run xcrun swiftc "$SCRIPT_DIR/native-approval.swift" -framework AppKit -framework LocalAuthentication -o "${APPROVAL_HELPER}.tmp"
     run chmod 500 "${APPROVAL_HELPER}.tmp"
     run /bin/mv -f "${APPROVAL_HELPER}.tmp" "$APPROVAL_HELPER"
-    log "progress" "[4/8] 50% — compiling baseline Touch ID approval helper"
+    log "progress" "[4/9] 44% — compiling baseline Touch ID approval helper"
     run xcrun swiftc "$SCRIPT_DIR/native-baseline-approval.swift" -framework AppKit -framework LocalAuthentication -o "${BASELINE_APPROVAL_HELPER}.tmp"
     run chmod 500 "${BASELINE_APPROVAL_HELPER}.tmp"
     run /bin/mv -f "${BASELINE_APPROVAL_HELPER}.tmp" "$BASELINE_APPROVAL_HELPER"
-    log "progress" "[5/8] 62% — compiling lock/clamshell state helper"
+    log "progress" "[5/9] 55% — compiling lock/clamshell state helper"
     run xcrun swiftc "$SCRIPT_DIR/native-lock-state.swift" -framework CoreGraphics -o "${LOCK_STATE_HELPER}.tmp"
     run chmod 500 "${LOCK_STATE_HELPER}.tmp"
     run /bin/mv -f "${LOCK_STATE_HELPER}.tmp" "$LOCK_STATE_HELPER"
-    log "progress" "[6/8] 75% — rendering private LaunchAgent"
+    log "progress" "[6/9] 66% — rendering private LaunchAgent"
     render_plist
-    log "progress" "[7/8] 88% — starting bag-safe headless backend"
+    log "progress" "[7/9] 77% — starting bag-safe headless backend"
     start_agent
-    log "progress" "[8/8] 100% — install complete"
+    log "progress" "[8/9] 88% — installing agent skill"
+    if ! run "$NODE_BIN" "$SCRIPT_DIR/cli.mjs" install-skill; then
+      log "error" "agent skill install failed (LaunchAgent is running; retry: node cli.mjs install-skill)"
+    fi
+    log "progress" "[9/9] 100% — install complete"
     show_observability
     show_status
     ;;

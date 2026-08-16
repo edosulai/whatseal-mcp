@@ -4,6 +4,8 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
+import { createRequire } from 'node:module';
+
 import {
   accountPaths,
   createLogger,
@@ -13,6 +15,15 @@ import {
   resolveAccountRecord,
   rpcCall,
 } from './lib/core.mjs';
+import {
+  DEFAULT_SKILL_PLATFORMS,
+  SKILL_PLATFORMS,
+  installSkill,
+  parseSkillPlatforms,
+  uninstallSkill,
+} from './lib/skill-install.mjs';
+
+const PACKAGE = createRequire(import.meta.url)('./package.json');
 
 const rawArgs = process.argv.slice(2);
 const { verbose, help } = parseCommonArgs(rawArgs);
@@ -43,9 +54,14 @@ Commands:
   prepare-reaction <chat-id-or-exact-name> <message-id> <emoji>
   request-approval <approval-id>
   send-outcome <approval-id>
+  install-skill [--platform P[,P]|all] [--project]
+  uninstall-skill [--platform P[,P]|all] [--project]
 
 request-approval opens an immutable native preview and requires Touch ID or the
 macOS login password before an externally visible send, quote-reply, reaction, or mark-read action.
+
+install-skill copies skills/whatseal/ to agent skill dirs (default: ${DEFAULT_SKILL_PLATFORMS.join(', ')}).
+Valid platforms: ${Object.keys(SKILL_PLATFORMS).join(', ')}
 `);
 }
 
@@ -56,7 +72,7 @@ function option(name, fallback = null) {
 
 function positional() {
   const result = [];
-  const optionsWithValues = new Set(['--limit', '--chat', '--account', '--since', '--timeout-sec']);
+  const optionsWithValues = new Set(['--limit', '--chat', '--account', '--since', '--timeout-sec', '--platform']);
   for (let index = 1; index < args.length; index += 1) {
     const value = args[index];
     if (optionsWithValues.has(value)) {
@@ -83,6 +99,27 @@ async function main() {
   if (command === 'help') {
     usage();
     log.info('complete', 'command=help');
+    return;
+  }
+
+  if (command === 'install-skill' || command === 'uninstall-skill') {
+    const platforms = parseSkillPlatforms(option('--platform'));
+    const project = args.includes('--project');
+    const payload = command === 'install-skill'
+      ? await installSkill({
+        projectRoot: PROJECT_ROOT,
+        platforms,
+        project,
+        projectDir: PROJECT_ROOT,
+        version: PACKAGE.version || '2.0.0',
+      })
+      : await uninstallSkill({
+        platforms,
+        project,
+        projectDir: PROJECT_ROOT,
+      });
+    process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+    log.info('complete', `command=${command}`);
     return;
   }
 

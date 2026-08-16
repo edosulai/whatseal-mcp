@@ -17,4 +17,6 @@ graphify-out/
 # Local vendor skills / editor hooks (not product source)
 .claude/
 .codex/
+.copilot/
+.agents/
 

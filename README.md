@@ -66,8 +66,9 @@ biometric approval.
 | `lib/browser-lifecycle.mjs` | Idle / on-demand browser policy helpers |
 | `lib/http-policy.mjs` | Default-off local HTTP policy + approval-safe Web send adapter |
 | `mcp-server.mjs` | Agent tools over MCP stdio |
-| `cli.mjs` | Local diagnostic and emergency command-line interface |
-| `install-launchagent.sh` | Idempotent macOS LaunchAgent lifecycle |
+| `cli.mjs` | Local diagnostic and emergency command-line interface; `install-skill` copies the agent skill |
+| `skills/whatseal/` | Bundled `SKILL.md` + references; `install-skill` copies this to agent skill dirs |
+| `install-launchagent.sh` | Idempotent macOS LaunchAgent lifecycle (also installs the agent skill) |
 | `native-approval.swift` | Immutable native preview + macOS user authentication |
 | `native-lock-state.swift` | Lightweight CGSession screen-lock probe |
 | `tests/` | Non-networked safety and serialization tests |
@@ -125,6 +126,17 @@ Claude Desktop equivalent (`claude_desktop_config.json`):
     }
   }
 }
+```
+
+`mcp-wrapper.sh` (and `./install-launchagent.sh install`) also copies
+`skills/whatseal/` to the user-global agent skill dirs — the same Graphify
+pattern (`~/.copilot/skills/whatseal/`, `~/.claude/skills/whatseal/`,
+`~/.codex/skills/whatseal/`, `~/.agents/skills/whatseal/`). Manual:
+
+```bash
+node cli.mjs install-skill
+node cli.mjs install-skill --platform all
+node cli.mjs install-skill --platform copilot --project
 ```
 
 The MCP process only speaks stdio tools. It does **not** auto-start Chrome.

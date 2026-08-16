@@ -11,6 +11,13 @@ Rules:
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
 
+## whatseal skill
+
+Bundled at `skills/whatseal/SKILL.md`. `node cli.mjs install-skill` (also run by
+`install-launchagent.sh install` and `mcp-wrapper.sh`) copies it to user-global
+agent skill dirs. When the user types `/whatseal` or asks about WhatsApp inbox,
+digest, reply, send, or pairing, follow that skill before improvising.
+
 ## Bag-safe power policy (built-in)
 
 - Default ON inside this tool (not a dotfiles guard). `LOCK_POWER_GUARD=1`.

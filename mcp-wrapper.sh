@@ -26,6 +26,12 @@ if [[ ! -d "$SCRIPT_DIR/node_modules/@modelcontextprotocol" ]]; then
   printf '%s script=whatsapp-mcp-wrapper pid=%s event=bootstrap-complete\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" >&2
 fi
 
+# Keep the global /whatseal skill in sync when an agent attaches this MCP.
+# stdout stays reserved for MCP stdio.
+if ! "$NODE_BIN" "$SCRIPT_DIR/cli.mjs" install-skill >/dev/null; then
+  printf '%s script=whatsapp-mcp-wrapper pid=%s event=skill-install-failed\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" >&2
+fi
+
 printf '%s script=whatsapp-mcp-wrapper pid=%s event=start detail=node=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$NODE_BIN" >&2
 if [[ "$VERBOSE" -eq 1 ]]; then
   exec "$NODE_BIN" "$SCRIPT_DIR/mcp-server.mjs" --verbose

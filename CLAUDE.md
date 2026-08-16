@@ -8,6 +8,13 @@ Rules:
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
 
+## whatseal skill
+
+Bundled at `skills/whatseal/SKILL.md`. `node cli.mjs install-skill` (also run by
+`install-launchagent.sh install` and `mcp-wrapper.sh`) copies it to user-global
+agent skill dirs. When the user types `/whatseal` or asks about WhatsApp inbox,
+digest, reply, send, or pairing, follow that skill before improvising.
+
 ## Public repo hygiene
 
 This repo may become public. Commits, commit messages, tags, and git history are visible forever. `.gitignore` only protects the next commit. A clean working tree is not a clean history.
