@@ -100,7 +100,7 @@ Copy [`accounts.example.json`](./accounts.example.json) to `accounts.json` and
 set the local account ids and aliases. `accounts.json` is gitignored and must
 not be committed.
 
-## MCP setup (VS Code / Copilot / Claude Desktop)
+## MCP setup (VS Code / Copilot / Claude Desktop / Hermes)
 
 1. Keep the backend LaunchAgent installed for each account you use.
 2. Point the IDE MCP config at `mcp-wrapper.sh` (absolute path):
@@ -131,13 +131,35 @@ Claude Desktop equivalent (`claude_desktop_config.json`):
 `mcp-wrapper.sh` (and `./install-launchagent.sh install`) also copies
 `skills/whatseal/` to the user-global agent skill dirs — the same Graphify
 pattern (`~/.copilot/skills/whatseal/`, `~/.claude/skills/whatseal/`,
-`~/.codex/skills/whatseal/`, `~/.agents/skills/whatseal/`). Manual:
+`~/.codex/skills/whatseal/`, `~/.agents/skills/whatseal/`,
+`~/.hermes/skills/whatseal/`). Manual:
 
 ```bash
 node cli.mjs install-skill
 node cli.mjs install-skill --platform all
+node cli.mjs install-skill --platform hermes
 node cli.mjs install-skill --platform copilot --project
 ```
+
+Hermes Agent is a default skill target. After `install-skill`, attach the
+stdio server once (then restart Hermes):
+
+```bash
+printf 'Y\n' | hermes mcp add whatseal --command /ABSOLUTE/PATH/TO/whatseal-mcp/mcp-wrapper.sh
+hermes mcp list
+hermes config get mcp_servers
+```
+
+Equivalent `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  whatseal:
+    command: /ABSOLUTE/PATH/TO/whatseal-mcp/mcp-wrapper.sh
+```
+
+Hermes registers those tools as `mcp_whatseal_whatsapp_*`. The bundled
+`/whatseal` skill still uses the unprefixed MCP names; map them.
 
 The MCP process only speaks stdio tools. It does **not** auto-start Chrome.
 If the backend is stopped or unpaired, tools return structured guidance

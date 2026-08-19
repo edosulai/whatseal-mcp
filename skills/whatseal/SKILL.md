@@ -11,6 +11,22 @@ or the macOS login password.
 
 Prefer MCP tools when they are available. The CLI is `node cli.mjs` from the
 whatseal-mcp checkout. Do not invent chats, messages, or send receipts.
+On Hermes Agent, MCP tools show up two ways:
+- native prefix `mcp_whatseal_whatsapp_*`
+- desktop deferred `mcp__whatseal__whatsapp_*` (double underscore) via
+  `tool_describe` / `tool_call`
+
+If neither skill nor MCP is attached, tell the user to run
+`node cli.mjs install-skill` then
+`printf 'Y\n' | hermes mcp add whatseal --command /ABSOLUTE/PATH/TO/whatseal-mcp/mcp-wrapper.sh`
+(non-TTY: the CLI prompts “Enable all tools?” and cancels on EOF unless you pipe `Y`).
+Verify with **both** `hermes mcp list` and `hermes config get mcp_servers`.
+
+Config persist ≠ this chat has the tools. After a successful add:
+1. `setup_mcp(server='whatseal', action='enable')` injects them into the
+   **current** desktop session (catalog `install` cannot attach a local
+   stdio wrapper).
+2. If enable is unavailable, restart Hermes / `/reload-mcp`.
 
 ## Usage
 
@@ -37,18 +53,36 @@ Follow these steps in order. Do not skip them.
 
 ### Step 1 — Readiness (always first)
 
-1. Call `whatsapp_doctor` or `whatsapp_list_accounts` (preferred first call in a new chat).
-2. If `code=IDLE_COLD`: Chrome is down on purpose. Call `whatsapp_wait_ready`
-   (`timeoutSec=180`) then retry the read. Do **not** start extra accounts or scan a QR.
-3. If `code=PAUSED_BY_LOCK`: the laptop is locked or the lid is closed. Tell the
-   user to unlock. Do not caffeinate / prevent-sleep.
-4. If stopped or unpaired: show the returned `userMessage` / start or pair steps.
-   Do not run start/install/QR unless the user asked.
-5. If pairing was explicitly requested: `whatsapp_qr` → user scans
-   **WhatsApp → Settings → Linked Devices → Link a Device** → `whatsapp_wait_ready`.
+1. Call `whatsapp_list_accounts` (preferred) or `whatsapp_doctor`. Doctor
+   without `account=` diagnoses the **default** only — another account can
+   be ready while default is stopped.
+2. Do not trust “should already be on”, a stale `status.json`, or
+   `launchctl` showing the job. Ready means live `ready: true` + control
+   socket present. `launchagent=loaded` / `state=spawn scheduled` with
+   `socket=missing` is **not** ready.
+3. If `code=IDLE_COLD` **and** the Unix socket exists: Chrome idled on
+   purpose. Call `whatsapp_wait_ready` (`timeoutSec=180`) then retry.
+   Do **not** start extra accounts or scan a QR.
+4. If `code=PAUSED_BY_LOCK`: the laptop is locked or the lid is closed.
+   Tell the user to unlock. Do not caffeinate / prevent-sleep.
+5. Stopped ≠ idle. `launchagent=not-loaded` + missing socket, or
+   `status.json` `phase=stopping` / `IDLE_COLD` with a stale pid and
+   `canWake=false`, means the daemon is down. `wait_ready` cannot wake
+   it. If the user asked to start it:
+   `./install-launchagent.sh start --account ID` (always pass an action
+   **and** `--account` — bare `./install-launchagent.sh` can hang).
+   Status right after start may still say `socket=missing` /
+   `phase=starting`; wait a few seconds, then `whatsapp_wait_ready`.
+6. If unpaired: show the returned `userMessage`. Do not run
+   start/install/QR unless the user asked.
+7. If pairing was explicitly requested: `whatsapp_qr` → user scans
+   **WhatsApp → Settings → Linked Devices → Link a Device** →
+   `whatsapp_wait_ready`.
 
-`idle_cold` is not a stopped backend. The Unix socket stays up; the first WhatsApp
-RPC after idle can take up to ~3 minutes.
+`idle_cold` is not a stopped backend **when the socket is up**. The first
+WhatsApp RPC after idle can take up to ~3 minutes. Each account has its
+own LaunchAgent; the one-hot-browser cap is per daemon, not “only one
+account on the machine”.
 
 ### Step 2 — Reads are free
 
@@ -73,8 +107,9 @@ Never claim a message was sent unless approval / `send_outcome` reports success.
 
 ### Step 4 — Do not freelance the machine
 
-- Do not start extra WhatsApp accounts, mint pairing artifacts, or leave a second
-  Chrome warm. Soft cap: one hot browser.
+- Do not start extra WhatsApp accounts, mint pairing artifacts, or leave a
+  second Chrome warm **unless the user asked**. Soft cap is one hot Chrome
+  **per account daemon**, not one account on the Mac.
 - Do not commit `accounts.json`, auth/session dirs, QR files, logs, or home paths.
 - Public docs and fixtures use placeholders only (`alpha` / `beta`, `work` / `personal`).
 

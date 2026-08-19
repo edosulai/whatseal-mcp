@@ -12,8 +12,11 @@ Rules:
 
 Bundled at `skills/whatseal/SKILL.md`. `node cli.mjs install-skill` (also run by
 `install-launchagent.sh install` and `mcp-wrapper.sh`) copies it to user-global
-agent skill dirs. When the user types `/whatseal` or asks about WhatsApp inbox,
-digest, reply, send, or pairing, follow that skill before improvising.
+agent skill dirs, including Hermes (`~/.hermes/skills/whatseal/`). When the user
+types `/whatseal` or asks about WhatsApp inbox, digest, reply, send, or pairing,
+follow that skill before improvising. On Hermes, attach MCP with
+`printf 'Y\n' | hermes mcp add whatseal --command /ABSOLUTE/PATH/TO/whatseal-mcp/mcp-wrapper.sh`
+(verify `hermes mcp list`) and treat tools as `mcp_whatseal_whatsapp_*`.
 
 ## Public repo hygiene
 

@@ -18,6 +18,7 @@ import {
 import {
   DEFAULT_SKILL_PLATFORMS,
   SKILL_PLATFORMS,
+  hermesMcpAttachCommand,
   installSkill,
   parseSkillPlatforms,
   uninstallSkill,
@@ -118,6 +119,9 @@ async function main() {
         project,
         projectDir: PROJECT_ROOT,
       });
+    if (command === 'install-skill' && platforms.includes('hermes') && !project) {
+      payload.hermes = hermesMcpAttachCommand(PROJECT_ROOT);
+    }
     process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
     log.info('complete', `command=${command}`);
     return;

@@ -60,4 +60,24 @@ in-memory fixtures only — they do not read arbitrary user files.
 | `uninstall-skill [--platform P] [--project]` | Remove only the whatseal skill copy |
 
 `./install-launchagent.sh install` and `mcp-wrapper.sh` run `install-skill`
-so hosts pick up `/whatseal` without a manual copy.
+so hosts pick up `/whatseal` without a manual copy. Default platforms:
+copilot, claude, codex, agents, hermes.
+
+Hermes also needs the MCP server attached once:
+
+```bash
+printf 'Y\n' | hermes mcp add whatseal --command /ABSOLUTE/PATH/TO/whatseal-mcp/mcp-wrapper.sh
+hermes mcp list
+hermes config get mcp_servers
+```
+
+Pipe `Y` — without a TTY the “Enable all tools?” prompt cancels and nothing is saved.
+Verify persist with `hermes mcp list` **and** `hermes config get mcp_servers`.
+Then either `setup_mcp(server='whatseal', action='enable')` in the current
+desktop chat, or restart Hermes / `/reload-mcp`. Tools appear as
+`mcp_whatseal_whatsapp_*` (native) or `mcp__whatseal__whatsapp_*` (desktop deferred).
+
+`whatsapp_doctor` without `account=` diagnoses the default only. Use
+`whatsapp_list_accounts` first when more than one account exists.
+Stopped (`launchagent=not-loaded`, missing socket, stale `phase=stopping`)
+is not `idle_cold`. Start with `./install-launchagent.sh start --account ID`.
