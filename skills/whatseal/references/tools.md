@@ -33,7 +33,7 @@ Omit it to use the configured default.
 | --- | --- | --- |
 | `whatsapp_unread_digest` | `digest [--limit N] [--no-preview] [--since TS]` | Inbox watch; default preview on |
 | `whatsapp_list_chats` | `chats [--limit N] [--unread] [--include-preview]` | Preview off by default |
-| `whatsapp_read_messages` | `messages <chat> [--limit N]` | Includes quoted id/body |
+| `whatsapp_read_messages` | `messages <chat> [--limit N]` | Includes quoted id/body. **Never downloads media.** |
 | `whatsapp_search_messages` | `search <query> [--chat ID_OR_NAME] [--limit N]` | |
 | `whatsapp_message_status` | `message-status <message-id>` | |
 

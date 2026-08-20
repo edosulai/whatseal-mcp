@@ -91,6 +91,19 @@ account on the machine”.
 - `whatsapp_read_messages` includes quoted-message id/body when present.
 - Duplicate display names can exist. Resolve by chat **id**, never by name alone.
 - In chat with the user, use aliases — not raw phone numbers or personal identifiers.
+- **Media is never downloaded** (MCP and CLI). `hasMedia: true` + empty
+  `body` is the image. Search quoted-image `body` is often a **truncated
+  JPEG thumbnail** (`/9j/…`, ~300–400 bytes) — not the screenshot.
+- HTTP `GET /api/media/:id` is opt-in (`WHATSEAL_WEB_API=1` /
+  `WHATSAPP_HTTP_API=1`). Port = `30000 + last 4 digits` of the account
+  (0100 → 30100). Default is off; refused `curl` is expected.
+- Chrome is `--headless=new --remote-debugging-pipe` — no DevTools port,
+  no window for `computer_use`.
+- Native WhatsApp.app `ChatStorage.sqlite` is a **different account**
+  than a Whatseal linked-device session. Empty desktop hits ≠ no media
+  on the Whatseal account.
+- Do not scrape Chrome `Cache_Data` for a portrait JPEG and treat it as
+  the user's screenshot. Report caption + message id instead.
 
 ### Step 3 — Writes are two-phase + Touch ID
 

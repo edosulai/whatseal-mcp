@@ -9,6 +9,8 @@ import test from 'node:test';
 import { accountPaths, rpcCall } from '../lib/core.mjs';
 
 const projectRoot = path.resolve(import.meta.dirname, '..');
+const isDarwin = process.platform === 'darwin';
+const isWin32 = process.platform === 'win32';
 
 async function waitFor(probe, {
   timeoutMs = 15_000,
@@ -64,6 +66,7 @@ function spawnDaemon(env) {
     cwd: projectRoot,
     env,
     stdio: ['ignore', 'ignore', 'pipe'],
+    windowsHide: true,
   });
   let stderr = '';
   child.stderr.setEncoding('utf8');
@@ -86,7 +89,116 @@ function waitForExit(child, timeoutMs = 10_000) {
   ]);
 }
 
-test('daemon stays cold and TCP-free, then lock resume exits without deadlock', { timeout: 35_000 }, async (t) => {
+function controlPathForEnv(accountId, env) {
+  return accountPaths(accountId, { env }).socket;
+}
+
+function daemonEnv({ accountId, stateRoot, dataRoot, httpPort, extra = {} }) {
+  return {
+    ...process.env,
+    WHATSAPP_ACCOUNT_ID: accountId,
+    WHATSAPP_AGENT_STATE: stateRoot,
+    WHATSAPP_AGENT_ROOT: dataRoot,
+    WHATSAPP_HTTP_PORT: String(httpPort),
+    BROWSER_POLICY: 'on_demand',
+    WHATSEAL_WEB_API: '0',
+    WHATSAPP_HTTP_API: '0',
+    WHATSAPP_CALL_AUDIO_HTTP: '0',
+    WHATSAPP_AUTO_ACCEPT_CALLS: '0',
+    LOCK_POWER_GUARD: '0',
+    ...extra,
+  };
+}
+
+function stopChild(child, { force = false } = {}) {
+  if (child.exitCode != null || child.signalCode != null) return;
+  if (isWin32) {
+    child.kill();
+    return;
+  }
+  child.kill(force ? 'SIGKILL' : 'SIGTERM');
+}
+
+async function waitUntilCold(socketPath, getStderr) {
+  return waitFor(async () => {
+    const next = await rpcCall('status', {}, { timeoutMs: 1000, socketPath }).catch(() => null);
+    return next?.phase === 'idle_cold' ? next : null;
+  }, { message: `daemon did not reach stable idle_cold\n${getStderr()}` });
+}
+
+test('cold daemon stays TCP-free and refuses directSend without waking Chrome', { timeout: 35_000 }, async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'whatseal-daemon-e2e-'));
+  const accountId = 'e2e';
+  const stateRoot = path.join(temporaryRoot, 'state');
+  const dataRoot = path.join(temporaryRoot, 'data');
+  const httpPort = await reserveLoopbackPort();
+  const env = daemonEnv({
+    accountId,
+    stateRoot,
+    dataRoot,
+    httpPort,
+    extra: { IDLE_CHROME_MS: '1000' },
+  });
+  const socketPath = controlPathForEnv(accountId, env);
+  const { child, getStderr } = spawnDaemon(env);
+  let childExited = false;
+  child.once('exit', () => {
+    childExited = true;
+  });
+
+  t.after(async () => {
+    if (!childExited) stopChild(child, { force: true });
+    await rm(temporaryRoot, { recursive: true, force: true });
+  });
+
+  const status = await waitUntilCold(socketPath, getStderr);
+  assert.equal(status.phase, 'idle_cold');
+  assert.equal(status.chromeAlive, false);
+  assert.equal(status.ready, false);
+  assert.equal(await canConnectTcp(httpPort), false, 'default daemon must not bind TCP');
+
+  const compatibility = await rpcCall('compatibility', {}, { timeoutMs: 15_000, socketPath });
+  assert.equal(compatibility.phase, 'idle_cold');
+  assert.equal(compatibility.runtime.browserVersion, null);
+  const audit = await rpcCall('securityAudit', {}, { timeoutMs: 10_000, socketPath });
+  assert.equal(audit.checks.find((entry) => entry.name === 'backend-tcp-listener')?.passed, true);
+  assert.equal(audit.checks.find((entry) => entry.name === 'chrome-debug-transport')?.skippedWhileBrowserCold, true);
+  const socketCheck = audit.checks.find((entry) => entry.name === 'control-socket');
+  if (isWin32) {
+    assert.equal(socketCheck, undefined, 'Windows named pipes must not be audited as filesystem sockets');
+  } else {
+    assert.equal(socketCheck?.passed, true);
+  }
+  const helperChecks = audit.checks.filter((entry) => /approval-helper$/.test(entry.name));
+  if (isDarwin) {
+    assert.equal(helperChecks.length, 2);
+  } else {
+    assert.equal(helperChecks.length, 0, 'Darwin approval helpers must not be required off Darwin');
+  }
+  assert.equal(status.lockPower?.enabled, false);
+
+  await assert.rejects(
+    rpcCall('directSend', { chat: 'nobody', text: 'must not send' }, { timeoutMs: 1000, socketPath }),
+    /directSend is disabled/,
+  );
+
+  const stillCold = await rpcCall('status', {}, { timeoutMs: 1000, socketPath });
+  assert.equal(stillCold.phase, 'idle_cold');
+  assert.equal(stillCold.chromeAlive, false);
+
+  stopChild(child);
+  const exit = await waitForExit(child, 10_000).catch((error) => {
+    throw new Error(`${error.message}\n${getStderr()}`);
+  });
+  if (!isWin32) {
+    assert.deepEqual(exit, { code: 0, signal: null });
+  }
+});
+
+test('daemon stays cold and TCP-free, then lock resume exits without deadlock', {
+  timeout: 35_000,
+  skip: isDarwin ? false : 'lock-power probes are Darwin-only',
+}, async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'whatseal-daemon-e2e-'));
   const accountId = 'e2e';
   const stateRoot = path.join(temporaryRoot, 'state');
@@ -102,26 +214,20 @@ test('daemon stays cold and TCP-free, then lock resume exits without deadlock', 
   );
   await chmod(lockHelper, 0o500);
 
-  const env = {
-    ...process.env,
-    WHATSAPP_ACCOUNT_ID: accountId,
-    WHATSAPP_AGENT_STATE: stateRoot,
-    WHATSAPP_AGENT_ROOT: dataRoot,
-    WHATSAPP_LOCK_STATE_HELPER: lockHelper,
-    WHATSEAL_E2E_LOCK_STATE: lockStateFile,
-    WHATSAPP_HTTP_PORT: String(httpPort),
-    BROWSER_POLICY: 'on_demand',
-    IDLE_CHROME_MS: '1000',
-    LOCK_POWER_GUARD: '1',
-    LOCK_POWER_GUARD_INTERVAL_MS: '100',
-    WHATSEAL_WEB_API: '0',
-    WHATSAPP_HTTP_API: '0',
-    WHATSAPP_CALL_AUDIO_HTTP: '0',
-    WHATSAPP_AUTO_ACCEPT_CALLS: '0',
-  };
-  const runtimePaths = accountPaths(accountId);
-  // accountPaths reads the current process environment, so construct child paths explicitly.
-  const socketPath = path.join(stateRoot, accountId, path.basename(runtimePaths.socket));
+  const env = daemonEnv({
+    accountId,
+    stateRoot,
+    dataRoot,
+    httpPort,
+    extra: {
+      WHATSAPP_LOCK_STATE_HELPER: lockHelper,
+      WHATSEAL_E2E_LOCK_STATE: lockStateFile,
+      IDLE_CHROME_MS: '1000',
+      LOCK_POWER_GUARD: '1',
+      LOCK_POWER_GUARD_INTERVAL_MS: '100',
+    },
+  });
+  const socketPath = controlPathForEnv(accountId, env);
   const { child, getStderr } = spawnDaemon(env);
   let childExited = false;
   child.once('exit', () => {
@@ -129,34 +235,16 @@ test('daemon stays cold and TCP-free, then lock resume exits without deadlock', 
   });
 
   t.after(async () => {
-    if (!childExited) child.kill('SIGKILL');
+    if (!childExited) stopChild(child, { force: true });
     await rm(temporaryRoot, { recursive: true, force: true });
   });
 
-  const status = await waitFor(async () => {
-    const next = await rpcCall('status', {}, { timeoutMs: 1000, socketPath }).catch(() => null);
-    return next?.phase === 'idle_cold' ? next : null;
-  }, { message: `daemon did not reach stable idle_cold\n${getStderr()}` });
+  const status = await waitUntilCold(socketPath, getStderr);
   assert.equal(status.phase, 'idle_cold');
   assert.equal(status.chromeAlive, false);
   assert.equal(status.ready, false);
+  assert.equal(status.lockPower?.enabled, true);
   assert.equal(await canConnectTcp(httpPort), false, 'default daemon must not bind TCP');
-
-  const compatibility = await rpcCall('compatibility', {}, { timeoutMs: 15_000, socketPath });
-  assert.equal(compatibility.phase, 'idle_cold');
-  assert.equal(compatibility.runtime.browserVersion, null);
-  const audit = await rpcCall('securityAudit', {}, { timeoutMs: 10_000, socketPath });
-  assert.equal(audit.checks.find((entry) => entry.name === 'backend-tcp-listener')?.passed, true);
-  assert.equal(audit.checks.find((entry) => entry.name === 'chrome-debug-transport')?.skippedWhileBrowserCold, true);
-
-  await assert.rejects(
-    rpcCall('directSend', { chat: 'nobody', text: 'must not send' }, { timeoutMs: 1000, socketPath }),
-    /directSend is disabled/,
-  );
-
-  const stillCold = await rpcCall('status', {}, { timeoutMs: 1000, socketPath });
-  assert.equal(stillCold.phase, 'idle_cold');
-  assert.equal(stillCold.chromeAlive, false);
 
   await writeLockState(lockStateFile, true);
   await waitFor(async () => {
@@ -178,19 +266,16 @@ test('explicit Web API opt-in binds loopback without waking cold Chrome', { time
   const stateRoot = path.join(temporaryRoot, 'state');
   const dataRoot = path.join(temporaryRoot, 'data');
   const httpPort = await reserveLoopbackPort();
-  const env = {
-    ...process.env,
-    WHATSAPP_ACCOUNT_ID: accountId,
-    WHATSAPP_AGENT_STATE: stateRoot,
-    WHATSAPP_AGENT_ROOT: dataRoot,
-    WHATSAPP_HTTP_PORT: String(httpPort),
-    BROWSER_POLICY: 'on_demand',
-    LOCK_POWER_GUARD: '0',
-    WHATSEAL_WEB_API: '1',
-    WHATSAPP_CALL_AUDIO_HTTP: '0',
-    WHATSAPP_AUTO_ACCEPT_CALLS: '0',
-  };
-  const socketPath = path.join(stateRoot, accountId, 'control.sock');
+  const env = daemonEnv({
+    accountId,
+    stateRoot,
+    dataRoot,
+    httpPort,
+    extra: {
+      WHATSEAL_WEB_API: '1',
+    },
+  });
+  const socketPath = controlPathForEnv(accountId, env);
   const { child, getStderr } = spawnDaemon(env);
   let childExited = false;
   child.once('exit', () => {
@@ -198,7 +283,7 @@ test('explicit Web API opt-in binds loopback without waking cold Chrome', { time
   });
 
   t.after(async () => {
-    if (!childExited) child.kill('SIGKILL');
+    if (!childExited) stopChild(child, { force: true });
     await rm(temporaryRoot, { recursive: true, force: true });
   });
 
@@ -223,9 +308,11 @@ test('explicit Web API opt-in binds loopback without waking cold Chrome', { time
   assert.equal(stillCold.phase, 'idle_cold');
   assert.equal(stillCold.chromeAlive, false);
 
-  child.kill('SIGTERM');
+  stopChild(child);
   const exit = await waitForExit(child, 10_000).catch((error) => {
     throw new Error(`${error.message}\n${getStderr()}`);
   });
-  assert.deepEqual(exit, { code: 0, signal: null });
+  if (!isWin32) {
+    assert.deepEqual(exit, { code: 0, signal: null });
+  }
 });

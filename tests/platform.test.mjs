@@ -7,7 +7,10 @@ import {
   requestNativeApproval,
 } from '../lib/native-approval.mjs';
 import {
+  assertPrivateControlSocket,
   describeControlTransport,
+  listenControlSocket,
+  removeStaleControlSocket,
 } from '../lib/control-transport.mjs';
 import {
   accountPaths,
@@ -16,6 +19,7 @@ import {
   describeInstallSupport,
   describeLockPowerSupport,
   normalizePlatform,
+  pathSecurityPassed,
   resolveAccountLayout,
   supportsPosixModes,
   usesFilesystemControlSocket,
@@ -35,6 +39,38 @@ test('posix modes and filesystem sockets stay fail-closed on Windows', () => {
   assert.equal(usesFilesystemControlSocket('darwin'), true);
   assert.equal(usesFilesystemControlSocket('linux'), true);
   assert.equal(usesFilesystemControlSocket('win32'), false);
+});
+
+test('pathSecurityPassed ignores posix mode and missing uid on Windows', () => {
+  const winProcess = {};
+  assert.equal(pathSecurityPassed({
+    typeOk: true,
+    metadata: { uid: undefined, mode: 0o100666 },
+    expectedMode: '0700',
+    platform: 'win32',
+    processRef: winProcess,
+  }), true);
+  assert.equal(pathSecurityPassed({
+    typeOk: false,
+    metadata: { uid: undefined, mode: 0o100666 },
+    expectedMode: '0700',
+    platform: 'win32',
+    processRef: winProcess,
+  }), false);
+  assert.equal(pathSecurityPassed({
+    typeOk: true,
+    metadata: { uid: 501, mode: 0o100700, isDirectory: () => true },
+    expectedMode: '0700',
+    platform: 'darwin',
+    processRef: { getuid: () => 501 },
+  }), true);
+  assert.equal(pathSecurityPassed({
+    typeOk: true,
+    metadata: { uid: 501, mode: 0o100777, isDirectory: () => true },
+    expectedMode: '0700',
+    platform: 'linux',
+    processRef: { getuid: () => 501 },
+  }), false);
 });
 
 test('default account roots keep Darwin paths and use XDG / LocalAppData elsewhere', () => {
@@ -130,6 +166,123 @@ test('sealed approval stays fail-closed off Darwin', async () => {
   );
 });
 
+function fakeHelperStat({ uid = process.getuid?.() ?? 501, mode = 0o100500 } = {}) {
+  return {
+    isSymbolicLink: () => false,
+    isFile: () => true,
+    uid,
+    mode,
+  };
+}
+
+function fakeHelperProcess(exitCode, { stderr = '' } = {}) {
+  let payload = null;
+  const spawnImpl = () => {
+    const child = {
+      stderr: {
+        setEncoding() {},
+        on(event, fn) {
+          if (event === 'data' && stderr) queueMicrotask(() => fn(stderr));
+        },
+      },
+      stdin: {
+        end(value) {
+          payload = value;
+        },
+      },
+      once(event, fn) {
+        if (event === 'close') queueMicrotask(() => fn(exitCode));
+      },
+    };
+    return child;
+  };
+  return {
+    spawnImpl,
+    payload: () => payload,
+  };
+}
+
+test('Darwin helper spawn maps approve, decline, and unexpected exits', async () => {
+  const approved = fakeHelperProcess(0);
+  assert.equal(
+    await requestNativeApproval({ target: 'chat', text: 'hi', action: 'send' }, {
+      helperPath: '/tmp/native-approval',
+      platform: 'darwin',
+      lstatImpl: async () => fakeHelperStat(),
+      spawnImpl: approved.spawnImpl,
+    }),
+    true,
+  );
+  assert.match(String(approved.payload()), /"action":"send"/);
+
+  const declined = fakeHelperProcess(2);
+  assert.equal(
+    await requestNativeApproval({ text: 'hi' }, {
+      helperPath: '/tmp/native-approval',
+      platform: 'darwin',
+      lstatImpl: async () => fakeHelperStat(),
+      spawnImpl: declined.spawnImpl,
+    }),
+    false,
+  );
+
+  const failed = fakeHelperProcess(1, { stderr: 'helper exploded' });
+  await assert.rejects(
+    () => requestNativeApproval({ text: 'hi' }, {
+      helperPath: '/tmp/native-approval',
+      platform: 'darwin',
+      lstatImpl: async () => fakeHelperStat(),
+      spawnImpl: failed.spawnImpl,
+    }),
+    /exit 1: helper exploded/,
+  );
+});
+
+test('Windows control transport skips filesystem socket chmod and unlink', async () => {
+  let chmodCalled = false;
+  let rmCalled = false;
+  const pipe = '\\\\.\\pipe\\whatsapp-agent-alice-deadbeef';
+  await listenControlSocket({
+    once() {},
+    listen(_path, resolve) {
+      resolve();
+    },
+  }, pipe, {
+    platform: 'win32',
+    chmodImpl: async () => {
+      chmodCalled = true;
+    },
+  });
+  assert.equal(chmodCalled, false);
+
+  const removed = await removeStaleControlSocket(pipe, {
+    platform: 'win32',
+    rmImpl: async () => {
+      rmCalled = true;
+    },
+  });
+  assert.equal(removed, false);
+  assert.equal(rmCalled, false);
+});
+
+test('assertPrivateControlSocket enforces 0600 on Unix and skips Windows', () => {
+  assert.equal(assertPrivateControlSocket({
+    isSocket: () => true,
+    mode: 0o100600,
+  }, { platform: 'darwin' }), true);
+  assert.throws(
+    () => assertPrivateControlSocket({
+      isSocket: () => true,
+      mode: 0o100666,
+    }, { platform: 'darwin' }),
+    /expected 0600/,
+  );
+  assert.equal(assertPrivateControlSocket({
+    isSocket: () => false,
+    mode: 0o100666,
+  }, { platform: 'win32' }), true);
+});
+
 test('resolveAccountLayout honors WHATSAPP_AGENT_ROOT overrides', () => {
   const layout = resolveAccountLayout({
     accountId: 'beta',
@@ -143,4 +296,17 @@ test('resolveAccountLayout honors WHATSAPP_AGENT_ROOT overrides', () => {
   assert.equal(layout.root, '/tmp/custom-root/beta');
   assert.equal(layout.state, '/tmp/custom-state/beta');
   assert.equal(layout.socket, '/tmp/custom-state/beta/control.sock');
+
+  const win = accountPaths('alpha', {
+    platform: 'win32',
+    homedir: '/tmp/whatseal-home',
+    env: {
+      WHATSAPP_AGENT_ROOT: '/tmp/custom-root',
+      WHATSAPP_AGENT_STATE: '/tmp/custom-state',
+      USERNAME: 'alice',
+    },
+  });
+  assert.equal(win.root, '/tmp/custom-root/alpha');
+  assert.equal(win.state, '/tmp/custom-state/alpha');
+  assert.match(win.socket, /^\\\\\.\\pipe\\whatsapp-agent-alice-[0-9a-f]{16}$/);
 });

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-import { copyFile, lstat, stat } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { copyFile, stat } from 'node:fs/promises';
 
 import { createLogger, parseCommonArgs, paths, rpcCall, writeJsonAtomic } from './lib/core.mjs';
+import { assertPrivateControlSocket } from './lib/control-transport.mjs';
+import { requestNativeApproval } from './lib/native-approval.mjs';
 
 const args = process.argv.slice(2);
 const { verbose, help } = parseCommonArgs(args);
@@ -13,28 +14,6 @@ const approvalHelper = `${paths.state}/native-baseline-approval`;
 
 function usage() {
   process.stdout.write(`Usage: node approve-baseline.mjs --approve-current [--verbose|-v]\n\nRuns the content-free compatibility self-test and promotes the current runtime\nas the last-known-good baseline. This command is intentionally not exposed via\nMCP. Review the printed version report before running it.\n`);
-}
-
-async function requestNativeApproval(tuple) {
-  const helper = await lstat(approvalHelper);
-  if (helper.isSymbolicLink() || !helper.isFile() || helper.uid !== process.getuid() || (helper.mode & 0o022) !== 0) {
-    throw new Error('Native baseline approval helper failed ownership or permission validation.');
-  }
-  return await new Promise((resolve, reject) => {
-    const child = spawn(approvalHelper, [], { stdio: ['pipe', 'ignore', 'pipe'] });
-    let stderr = '';
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk) => {
-      stderr = `${stderr}${chunk}`.slice(-4096);
-    });
-    child.once('error', reject);
-    child.once('close', (code) => {
-      if (code === 0) resolve(true);
-      else if (code === 2) resolve(false);
-      else reject(new Error(`Native baseline approval failed with exit ${code}: ${stderr.trim()}`));
-    });
-    child.stdin.end(JSON.stringify(tuple));
-  });
 }
 
 async function main() {
@@ -54,8 +33,8 @@ async function main() {
 
   log.info('progress', '[1/5] 20% — verifying private control socket mode');
   const socket = await stat(paths.socket);
+  assertPrivateControlSocket(socket);
   const socketMode = (socket.mode & 0o777).toString(8).padStart(4, '0');
-  if (socketMode !== '0600') throw new Error(`Private socket mode is ${socketMode}, expected 0600.`);
 
   log.info('progress', '[2/5] 40% — building immutable version tuple');
   const report = test.compatibility;
@@ -101,7 +80,7 @@ async function main() {
   process.stdout.write(`${JSON.stringify(baseline, null, 2)}\n`);
 
   log.info('progress', '[3/5] 60% — requiring native user-presence approval');
-  const authorized = await requestNativeApproval(baseline.approved);
+  const authorized = await requestNativeApproval(baseline.approved, { helperPath: approvalHelper });
   if (!authorized) throw new Error('Compatibility baseline approval was declined.');
 
   log.info('progress', '[4/5] 80% — preserving previous baseline when present');

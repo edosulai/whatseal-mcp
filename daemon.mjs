@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createReadStream } from 'node:fs';
-import { chmod, lstat, readdir, readFile, readlink, rm } from 'node:fs/promises';
-import { execFile, spawn } from 'node:child_process';
+import { lstat, readdir, readFile, readlink, rm } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { deflateSync } from 'node:zlib';
@@ -48,6 +48,22 @@ import {
   executeApprovedHttpSend,
   parseLocalHttpPolicy,
 } from './lib/http-policy.mjs';
+import {
+  controlSocketIsActive,
+  listenControlSocket,
+  removeStaleControlSocket,
+} from './lib/control-transport.mjs';
+import {
+  describeApprovalCapability,
+  requestNativeApproval as requestNativeApprovalHelper,
+} from './lib/native-approval.mjs';
+import {
+  currentOwnerId,
+  describeLockPowerSupport,
+  formatMode,
+  pathSecurityPassed,
+  usesFilesystemControlSocket,
+} from './lib/platform.mjs';
 
 import {
   deepProbeVoipStack,
@@ -254,7 +270,8 @@ let sendApprovalInFlight = false;
 let outcomeWriteQueue = Promise.resolve();
 // Built-in bag-safe power policy: pause Chrome/hot work on lock or lid close.
 // Default ON. Set LOCK_POWER_GUARD=0 to disable. Never uses caffeinate.
-const lockPowerGuardEnabled = isLockPowerGuardEnabled(process.env);
+const lockPowerGuardEnabled = isLockPowerGuardEnabled(process.env)
+  && describeLockPowerSupport().supported;
 const lockStateHelperPath = process.env.WHATSAPP_LOCK_STATE_HELPER
   || `${paths.state}/native-lock-state`;
 let pausedByLock = false;
@@ -941,7 +958,7 @@ async function getSecurityAudit() {
   const checkPath = async (name, target, expectedMode, expectedType) => {
     try {
       const metadata = await lstat(target);
-      const actualMode = (metadata.mode & 0o777).toString(8).padStart(4, '0');
+      const actualMode = formatMode(metadata);
       const typeOk = expectedType === 'directory'
         ? metadata.isDirectory()
         : expectedType === 'socket'
@@ -949,12 +966,12 @@ async function getSecurityAudit() {
           : metadata.isFile() && !metadata.isSymbolicLink();
       checks.push({
         name,
-        passed: typeOk && metadata.uid === process.getuid() && actualMode === expectedMode,
+        passed: pathSecurityPassed({ typeOk, metadata, expectedMode }),
         target,
         expectedMode,
         actualMode,
-        ownerUid: metadata.uid,
-        expectedOwnerUid: process.getuid(),
+        ownerUid: metadata.uid ?? null,
+        expectedOwnerUid: currentOwnerId(),
         expectedType,
       });
     } catch (error) {
@@ -965,9 +982,13 @@ async function getSecurityAudit() {
   await checkPath('profile-root', paths.root, '0700', 'directory');
   await checkPath('auth-profile', paths.auth, '0700', 'directory');
   await checkPath('state-root', paths.state, '0700', 'directory');
-  await checkPath('control-socket', paths.socket, '0600', 'socket');
-  await checkPath('message-approval-helper', approvalHelper, '0500', 'file');
-  await checkPath('baseline-approval-helper', `${paths.state}/native-baseline-approval`, '0500', 'file');
+  if (usesFilesystemControlSocket()) {
+    await checkPath('control-socket', paths.socket, '0600', 'socket');
+  }
+  if (describeApprovalCapability().supported) {
+    await checkPath('message-approval-helper', approvalHelper, '0500', 'file');
+    await checkPath('baseline-approval-helper', `${paths.state}/native-baseline-approval`, '0500', 'file');
+  }
 
   const browserArgs = client?.pupBrowser?.process()?.spawnargs || [];
   const browserAvailable = isBrowserSessionAlive();
@@ -1708,28 +1729,13 @@ async function recordOutcome(approvalId, outcome) {
 }
 
 async function requestNativeApproval(draft) {
-  const helperMetadata = await lstat(approvalHelper);
-  if (helperMetadata.isSymbolicLink() || !helperMetadata.isFile() || helperMetadata.uid !== process.getuid()) {
-    throw new Error('Native approval helper failed ownership or file-type validation.');
-  }
-  if ((helperMetadata.mode & 0o022) !== 0) {
-    throw new Error('Native approval helper must not be group- or world-writable.');
-  }
-  return await new Promise((resolve, reject) => {
-    const child = spawn(approvalHelper, [], { stdio: ['pipe', 'ignore', 'pipe'] });
-    let stderr = '';
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk;
-      if (stderr.length > 4096) stderr = stderr.slice(-4096);
-    });
-    child.once('error', reject);
-    child.once('close', (code) => {
-      if (code === 0) resolve(true);
-      else if (code === 2) resolve(false);
-      else reject(new Error(`Native approval failed with exit ${code}: ${truncateText(stderr, 300)}`));
-    });
-    child.stdin.end(JSON.stringify({ target: draft.chatName || draft.chatId, text: draft.text, action: draft.action }));
+  return requestNativeApprovalHelper({
+    target: draft.chatName || draft.chatId,
+    text: draft.text,
+    action: draft.action,
+  }, {
+    helperPath: approvalHelper,
+    truncate: truncateText,
   });
 }
 
@@ -3849,21 +3855,7 @@ async function acceptIncomingCall(callInfo, {
 
 
 async function socketIsActive() {
-  try {
-    const stat = await lstat(paths.socket);
-    if (!stat.isSocket()) throw new Error(`Refusing to replace non-socket path: ${paths.socket}`);
-  } catch (error) {
-    if (error.code === 'ENOENT') return false;
-    throw error;
-  }
-  return await new Promise((resolve) => {
-    const probe = net.createConnection(paths.socket);
-    probe.once('connect', () => {
-      probe.destroy();
-      resolve(true);
-    });
-    probe.once('error', () => resolve(false));
-  });
+  return controlSocketIsActive(paths.socket);
 }
 
 async function shutdown(signal, exitCode = 0) {
@@ -3888,7 +3880,7 @@ async function shutdown(signal, exitCode = 0) {
     new Promise((resolve) => setTimeout(resolve, 2000)),
   ]);
   await destroyBrowserSession('shutdown').catch(() => {});
-  await rm(paths.socket, { force: true });
+  await removeStaleControlSocket(paths.socket);
   await removeQr();
   log.info('shutdown-complete', `signal=${signal}`);
   process.exit(exitCode);
@@ -4000,14 +3992,10 @@ async function main() {
     await writeJsonAtomic(paths.sendLedger, { version: 1, outcomes: [...sendOutcomes.values()].slice(-200) });
   }
   if (await socketIsActive()) throw new Error(`Another WhatsApp backend is already listening at ${paths.socket}`);
-  await rm(paths.socket, { force: true });
+  await removeStaleControlSocket(paths.socket);
 
   server = net.createServer((socket) => void handleConnection(socket));
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(paths.socket, resolve);
-  });
-  await chmod(paths.socket, 0o600);
+  await listenControlSocket(server, paths.socket);
   await publishState();
   log.info('control-socket-ready', `path=${paths.socket}`);
 
