@@ -110,6 +110,11 @@ Never claim a message was sent unless approval / `send_outcome` reports success.
 - Do not start extra WhatsApp accounts, mint pairing artifacts, or leave a
   second Chrome warm **unless the user asked**. Soft cap is one hot Chrome
   **per account daemon**, not one account on the Mac.
+- **Instaseal is a different repo.** Instagram account ids belong there, not
+  in whatseal. Filter process listings by `whatseal-mcp/` — both daemons are
+  named `daemon.mjs`.
+- Installed MCP is this checkout (`mcp-wrapper.sh`), not a second copy.
+  After pull: restart LaunchAgents per account. Stdio MCP respawns next session.
 - Do not commit `accounts.json`, auth/session dirs, QR files, logs, or home paths.
 - Public docs and fixtures use placeholders only (`alpha` / `beta`, `work` / `personal`).
 

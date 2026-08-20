@@ -18,7 +18,7 @@
     "web:install": "cd web && npm install",
     "test:e2e": "node --test tests/daemon-lifecycle.e2e.test.mjs",
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check daemon.mjs && node --check cli.mjs && node --check mcp-server.mjs && node --check web-gateway.mjs && node --check approve-baseline.mjs && node --check lib/lock-power-guard.mjs && node --check lib/browser-lifecycle.mjs && node --check lib/http-policy.mjs && node --check lib/skill-install.mjs && node --test tests/*.test.mjs"
+    "check": "node --check daemon.mjs && node --check cli.mjs && node --check mcp-server.mjs && node --check web-gateway.mjs && node --check approve-baseline.mjs && node --check lib/lock-power-guard.mjs && node --check lib/browser-lifecycle.mjs && node --check lib/http-policy.mjs && node --check lib/skill-install.mjs && node --check lib/platform.mjs && node --check lib/native-approval.mjs && node --check lib/control-transport.mjs && node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
