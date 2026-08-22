@@ -14,7 +14,7 @@ own private approval tuple under `~/.local/state/whatsapp-agent/`.
 | Platform | `darwin-arm64` |
 | Backend | `1.0.0` |
 | `whatsapp-web.js` package version | `1.34.7` |
-| `whatsapp-web.js` source | Commit `1780711a1c86dfeca7c5ba6a66f950eac93dde28` |
+| `whatsapp-web.js` source | vendored `vendor/whatsapp-web.js` (`1.34.7`, `puppeteer-core`) |
 | `package-lock.json` SHA-256 | `3637dd25b90262970d52011beb4edc9bd3f8a1492c24eb1bbc26fc6a756fca59` |
 | Backend startup source SHA-256 | `899787a59314932af987eeb1ff6627a4d911a31f6c67848a9d107df74e667e4c` |
 | Installed dependencies SHA-256 | `220cccd67180329a5e54753442784cdc3e834fcfc4a5bb2294520481cf2680cc` |

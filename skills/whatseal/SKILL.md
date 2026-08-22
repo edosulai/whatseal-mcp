@@ -9,17 +9,18 @@ Sealed WhatsApp MCP — a local linked-device WhatsApp Web session for AI agents
 Reading chats is free. Every externally visible action is sealed until Touch ID
 or the macOS login password.
 
-Prefer MCP tools when they are available. The CLI is `node cli.mjs` from the
-whatseal-mcp checkout. Do not invent chats, messages, or send receipts.
+Prefer MCP tools when they are available. The CLI is `whatseal` (`npx -y whatseal`)
+or `node cli.mjs` from a checkout. Do not invent chats, messages, or send receipts.
 On Hermes Agent, MCP tools show up two ways:
 - native prefix `mcp_whatseal_whatsapp_*`
 - desktop deferred `mcp__whatseal__whatsapp_*` (double underscore) via
   `tool_describe` / `tool_call`
 
 If neither skill nor MCP is attached, tell the user to run
-`node cli.mjs install-skill` then
-`printf 'Y\n' | hermes mcp add whatseal --command /ABSOLUTE/PATH/TO/whatseal-mcp/mcp-wrapper.sh`
+`whatseal setup` (or `node cli.mjs install-skill` from a checkout) then
+`printf 'Y\n' | hermes mcp add whatseal --command npx --args -y --args whatseal --args mcp`
 (non-TTY: the CLI prompts “Enable all tools?” and cancels on EOF unless you pipe `Y`).
+From a git checkout, `mcp-wrapper.sh` is the same Node entry.
 Verify with **both** `hermes mcp list` and `hermes config get mcp_servers`.
 
 Config persist ≠ this chat has the tools. After a successful add:
@@ -126,8 +127,14 @@ Never claim a message was sent unless approval / `send_outcome` reports success.
 - **Instaseal is a different repo.** Instagram account ids belong there, not
   in whatseal. Filter process listings by `whatseal-mcp/` — both daemons are
   named `daemon.mjs`.
-- Installed MCP is this checkout (`mcp-wrapper.sh`), not a second copy.
+- Preferred MCP attach is `npx -y whatseal mcp`, not a second checkout copy.
+  From a git checkout, `mcp-wrapper.sh` is the same Node entry (`bin/whatseal-mcp.mjs`).
   After pull: restart LaunchAgents per account. Stdio MCP respawns next session.
+  Use **`whatseal@2.0.3` or later**. `2.0.0`–`2.0.2` are deprecated (`npx`
+  install failed: git dep / nested `puppeteer` chrome-headless-shell
+  postinstall). Prove `npx` from `/tmp`, never from this checkout. The
+  published tree vendors `whatsapp-web.js` against `puppeteer-core` and
+  launches system Chrome (`WHATSAPP_CHROME_PATH` or platform candidates).
 - Do not commit `accounts.json`, auth/session dirs, QR files, logs, or home paths.
 - Public docs and fixtures use placeholders only (`alpha` / `beta`, `work` / `personal`).
 

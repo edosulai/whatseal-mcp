@@ -21,6 +21,9 @@ import {
   normalizePlatform,
   pathSecurityPassed,
   resolveAccountLayout,
+  resolveAccountsFile,
+  resolveChromePath,
+  defaultChromeCandidates,
   supportsPosixModes,
   usesFilesystemControlSocket,
 } from '../lib/platform.mjs';
@@ -309,4 +312,53 @@ test('resolveAccountLayout honors WHATSAPP_AGENT_ROOT overrides', () => {
   assert.equal(win.root, '/tmp/custom-root/alpha');
   assert.equal(win.state, '/tmp/custom-state/alpha');
   assert.match(win.socket, /^\\\\\.\\pipe\\whatsapp-agent-alice-[0-9a-f]{16}$/);
+});
+
+test('accounts.json lives in user state, not the npm package root', () => {
+  const userPath = resolveAccountsFile({
+    platform: 'darwin',
+    homedir: '/tmp/whatseal-home',
+    projectRoot: '/opt/whatseal',
+    env: {},
+    existsSync: () => false,
+  });
+  assert.equal(userPath, '/tmp/whatseal-home/.local/state/whatsapp-agent/accounts.json');
+
+  const checkoutPath = resolveAccountsFile({
+    platform: 'darwin',
+    homedir: '/tmp/whatseal-home',
+    projectRoot: '/opt/whatseal',
+    env: {},
+    existsSync: (target) => target === '/opt/whatseal/accounts.json',
+  });
+  assert.equal(checkoutPath, '/opt/whatseal/accounts.json');
+
+  const envPath = resolveAccountsFile({
+    platform: 'darwin',
+    homedir: '/tmp/whatseal-home',
+    projectRoot: '/opt/whatseal',
+    env: { WHATSEAL_ACCOUNTS: '/tmp/custom-accounts.json' },
+    existsSync: () => false,
+  });
+  assert.equal(envPath, '/tmp/custom-accounts.json');
+});
+
+test('resolveChromePath prefers env, then platform candidates', async () => {
+  assert.equal(
+    await resolveChromePath({ env: { WHATSAPP_CHROME_PATH: '/opt/chrome' }, existsSync: () => false }),
+    '/opt/chrome',
+  );
+  assert.equal(
+    await resolveChromePath({
+      env: {},
+      platform: 'darwin',
+      existsSync: (target) => target === '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    }),
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  );
+  assert.deepEqual(defaultChromeCandidates('linux')[0], '/usr/bin/google-chrome-stable');
+  await assert.rejects(
+    () => resolveChromePath({ env: {}, platform: 'darwin', existsSync: () => false }),
+    /WHATSAPP_CHROME_PATH/,
+  );
 });

@@ -1,0 +1,15 @@
+accounts.json
+.env
+.env.*
+node_modules/
+graphify-out/
+.hermes/
+.claude/
+.codex/
+.copilot/
+.agents/
+web/
+assets/audio/
+*.log
+.git/
+*.tgz

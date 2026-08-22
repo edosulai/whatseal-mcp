@@ -23,6 +23,8 @@ import {
   parseSkillPlatforms,
   uninstallSkill,
 } from './lib/skill-install.mjs';
+import { resolveAccountsFile } from './lib/platform.mjs';
+import { formatSetupReport, parseSetupArgs, runSetup } from './lib/setup.mjs';
 
 const PACKAGE = createRequire(import.meta.url)('./package.json');
 
@@ -34,9 +36,12 @@ const command = args[0] || (help ? 'help' : 'status');
 const PROJECT_ROOT = path.dirname(fileURLToPath(import.meta.url));
 
 function usage() {
-  process.stdout.write(`Usage: node cli.mjs <command> [options] [--account ID|alias] [--verbose|-v]
+  process.stdout.write(`Usage: whatseal <command> [options] [--account ID|alias] [--verbose|-v]
+       node cli.mjs <command> [options]
 
 Commands:
+  setup [--client hermes|claude|cursor|vscode|all] [--account ID] [--install-agent]
+  mcp
   status
   wait-ready [--timeout-sec N]
   compatibility
@@ -58,6 +63,12 @@ Commands:
   install-skill [--platform P[,P]|all] [--project]
   uninstall-skill [--platform P[,P]|all] [--project]
 
+setup checks Node/Chrome, copies accounts.example.json if missing, installs the
+/whatseal skill, and prints MCP snippets. It does not register a LaunchAgent
+unless you pass --install-agent.
+
+mcp starts the stdio MCP server (same as the whatseal-mcp bin).
+
 request-approval opens an immutable native preview and requires Touch ID or the
 macOS login password before an externally visible send, quote-reply, reaction, or mark-read action.
 
@@ -73,7 +84,7 @@ function option(name, fallback = null) {
 
 function positional() {
   const result = [];
-  const optionsWithValues = new Set(['--limit', '--chat', '--account', '--since', '--timeout-sec', '--platform']);
+  const optionsWithValues = new Set(['--limit', '--chat', '--account', '--since', '--timeout-sec', '--platform', '--client']);
   for (let index = 1; index < args.length; index += 1) {
     const value = args[index];
     if (optionsWithValues.has(value)) {
@@ -88,7 +99,7 @@ function positional() {
 
 async function resolveCliAccount() {
   const accountParam = option('--account');
-  const config = await readJson(path.join(PROJECT_ROOT, 'accounts.json'), { accounts: [], default: null });
+  const config = await readJson(resolveAccountsFile({ projectRoot: PROJECT_ROOT }), { accounts: [], default: null });
   if (!accountParam && (!config.accounts || config.accounts.length === 0)) {
     return { id: process.env.WHATSAPP_ACCOUNT_ID || null, record: null, paths: accountPaths(process.env.WHATSAPP_ACCOUNT_ID || null) };
   }
@@ -100,6 +111,24 @@ async function main() {
   if (command === 'help') {
     usage();
     log.info('complete', 'command=help');
+    return;
+  }
+
+  if (command === 'setup') {
+    const parsed = parseSetupArgs(args);
+    const payload = await runSetup({
+      projectRoot: PROJECT_ROOT,
+      account: parsed.account,
+      installAgent: parsed.installAgent,
+      version: PACKAGE.version || '2.0.0',
+    });
+    process.stdout.write(formatSetupReport(payload));
+    log.info('complete', 'command=setup');
+    return;
+  }
+
+  if (command === 'mcp') {
+    await import(new URL('./bin/whatseal-mcp.mjs', import.meta.url));
     return;
   }
 

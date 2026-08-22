@@ -19,4 +19,10 @@ graphify-out/
 .codex/
 .copilot/
 .agents/
+.hermes/
+
+# Published puppeteer / whatsapp-web.js aliases. A user-global gitignore
+# may exclude `vendor/` (Go convention); this repo must ship those trees.
+!vendor/
+!vendor/**
 

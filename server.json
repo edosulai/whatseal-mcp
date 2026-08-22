@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "name": "io.github.edosulai/whatseal",
+  "description": "Sealed WhatsApp MCP for macOS. Reads are free. Every send, quote-reply, reaction, or mark-read waits for Touch ID. Windows/Linux sealed send is not shipped.",
+  "status": "active",
+  "repository": {
+    "url": "https://github.com/edosulai/whatseal-mcp",
+    "source": "github"
+  },
+  "version": "2.0.3",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "whatseal",
+      "version": "2.0.3",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "npx",
+      "packageArguments": ["mcp"]
+    }
+  ]
+}

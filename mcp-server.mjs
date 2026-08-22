@@ -20,6 +20,7 @@ import {
   rpcCall,
 } from './lib/core.mjs';
 import { isIdleColdPhase } from './lib/browser-lifecycle.mjs';
+import { resolveAccountsFile } from './lib/platform.mjs';
 
 const require = createRequire(import.meta.url);
 const { verbose, help } = parseCommonArgs(process.argv.slice(2));
@@ -49,7 +50,7 @@ if (help) {
   process.exit(0);
 }
 
-const accountsConfigPromise = readJson(new URL('./accounts.json', import.meta.url).pathname, { accounts: [], default: null });
+const accountsConfigPromise = readJson(resolveAccountsFile({ projectRoot: PROJECT_ROOT }), { accounts: [], default: null });
 let accountsCache = null;
 
 async function getAccounts() {

@@ -1,10 +1,12 @@
 # whatseal tools
 
-Prefer MCP tools when the host has the `whatseal` server attached. CLI commands
-run from the whatseal-mcp checkout: `node cli.mjs <command> [--account ID|alias]`.
+Prefer MCP tools when the host has the `whatseal` server attached. CLI is
+`whatseal <command>` (`npx -y whatseal`) or, from a checkout,
+`node cli.mjs <command> [--account ID|alias]`.
 
-Every MCP tool accepts optional `account` (id or alias from local `accounts.json`).
-Omit it to use the configured default.
+Every MCP tool accepts optional `account` (id or alias from local `accounts.json`,
+or `~/.local/state/whatsapp-agent/accounts.json` after `whatseal setup`).
+Omit it to use the configured default. Override with `WHATSEAL_ACCOUNTS`.
 
 ## Onboarding / readiness
 

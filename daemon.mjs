@@ -92,6 +92,7 @@ import {
   serializePeerJid,
 } from './lib/call-policy.mjs';
 import { parseSingleByteRange } from './lib/call-audio.mjs';
+import { resolveChromePath } from './lib/platform.mjs';
 
 // Prefer CLI --account, then WHATSAPP_ACCOUNT_ID from LaunchAgent/env.
 // LaunchAgent historically only set the env var (no CLI flag); without this fallback
@@ -123,8 +124,22 @@ const { LoadUtils } = require('whatsapp-web.js/src/util/Injected/Utils');
 const execFileAsync = promisify(execFile);
 const appPackage = require('./package.json');
 const whatsappPackage = require('whatsapp-web.js/package.json');
-const appLock = require('./package-lock.json');
-const packageLockPath = require.resolve('./package-lock.json');
+const appLock = (() => {
+  try {
+    return require('./package-lock.json');
+  } catch (error) {
+    if (error.code !== 'MODULE_NOT_FOUND') throw error;
+    return require('./npm-shrinkwrap.json');
+  }
+})();
+const packageLockPath = (() => {
+  try {
+    return require.resolve('./package-lock.json');
+  } catch (error) {
+    if (error.code !== 'MODULE_NOT_FOUND') throw error;
+    return require.resolve('./npm-shrinkwrap.json');
+  }
+})();
 const sourceRoot = fileURLToPath(new URL('.', import.meta.url));
 const runtimeSourceFiles = [
   'daemon.mjs',
@@ -308,7 +323,7 @@ const syntheticVCard = [
   'END:VCARD',
 ].join('\r\n');
 
-const chromePath = process.env.WHATSAPP_CHROME_PATH || await require('puppeteer').executablePath();
+const chromePath = await resolveChromePath();
 const approvalHelper = process.env.WHATSAPP_APPROVAL_HELPER || `${paths.state}/native-approval`;
 
 function createWhatsAppClient() {

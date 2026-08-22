@@ -1,0 +1,8 @@
+{
+  "name": "puppeteer",
+  "version": "24.38.0",
+  "description": "whatseal alias: re-export puppeteer-core without a browser postinstall",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "index.cjs"
+}

@@ -31,8 +31,11 @@ test('hermes skill dest and MCP attach command stay portable', () => {
   assert.equal(dest, '/tmp/whatseal-home/.hermes/skills/whatseal/SKILL.md');
   const attach = hermesMcpAttachCommand('/opt/whatseal-mcp');
   assert.equal(attach.host, 'hermes');
-  assert.equal(attach.config.mcp_servers.whatseal.command, '/opt/whatseal-mcp/mcp-wrapper.sh');
-  assert.match(attach.add, /hermes mcp add whatseal --command "\/opt\/whatseal-mcp\/mcp-wrapper\.sh"/);
+  assert.equal(attach.config.mcp_servers.whatseal.command, 'npx');
+  assert.deepEqual(attach.config.mcp_servers.whatseal.args, ['-y', 'whatseal', 'mcp']);
+  assert.match(attach.add, /hermes mcp add whatseal --command npx/);
+  assert.equal(attach.local.command, '/opt/whatseal-mcp/mcp-wrapper.sh');
+  assert.match(attach.local.add, /mcp-wrapper\.sh/);
 });
 
 test('install-skill copies SKILL.md and references into isolated agent dirs', async () => {
