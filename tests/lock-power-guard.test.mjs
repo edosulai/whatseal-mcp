@@ -8,6 +8,7 @@ import {
   parseClamshellState,
   parseScreenLockState,
   readPowerSessionState,
+  shouldExitProcessOnLockResume,
 } from '../lib/lock-power-guard.mjs';
 
 test('lock power guard enabled by default', () => {
@@ -162,4 +163,9 @@ test('stop called from resume callback does not await itself', async () => {
   ]);
   assert.equal(resumed, true);
   assert.equal(guard.getStatus().running, false);
+});
+
+test('session daemons must not exit on lock-resume (no LaunchAgent KeepAlive)', () => {
+  assert.equal(shouldExitProcessOnLockResume(), true);
+  assert.equal(shouldExitProcessOnLockResume({ WHATSEAL_SESSION: '1' }), false);
 });

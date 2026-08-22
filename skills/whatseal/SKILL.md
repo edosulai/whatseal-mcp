@@ -66,14 +66,20 @@ Follow these steps in order. Do not skip them.
    Do **not** start extra accounts or scan a QR.
 4. If `code=PAUSED_BY_LOCK`: the laptop is locked or the lid is closed.
    Tell the user to unlock. Do not caffeinate / prevent-sleep.
-5. Stopped ≠ idle. `launchagent=not-loaded` + missing socket, or
-   `status.json` `phase=stopping` / `IDLE_COLD` with a stale pid and
-   `canWake=false`, means the daemon is down. `wait_ready` cannot wake
-   it. If the user asked to start it:
-   `./install-launchagent.sh start --account ID` (always pass an action
-   **and** `--account` — bare `./install-launchagent.sh` can hang).
-   Status right after start may still say `socket=missing` /
-   `phase=starting`; wait a few seconds, then `whatsapp_wait_ready`.
+5. Stopped ≠ idle. Missing socket, or `status.json` `phase=stopping` /
+   `IDLE_COLD` with a stale pid and `canWake=false`, means the daemon is
+   down. `whatsapp_status` / `whatsapp_doctor` / `whatsapp_list_accounts`
+   never spawn — they return `BACKEND_STOPPED` and still say “ask
+   permission”. Spawn only when the user asked to start/pair/wait-ready:
+   `whatsapp_wait_ready` / `whatsapp_qr` / `whatseal start`. If a
+   LaunchAgent already owns the socket, do **not** also `whatseal start`
+   (same `control.sock`; `stop` will refuse without `daemon.pid`).
+   Persistent login start remains opt-in (`--install-agent` /
+   `./install-launchagent.sh install --account ID`). Always pass an
+   action **and** `--account` to the LaunchAgent script — bare
+   `./install-launchagent.sh` can hang. Status right after start may
+   still say `socket=missing` / `phase=starting`; wait a few seconds,
+   then `whatsapp_wait_ready`.
 6. If unpaired: show the returned `userMessage`. Do not run
    start/install/QR unless the user asked.
 7. If pairing was explicitly requested: `whatsapp_qr` → user scans
@@ -141,5 +147,34 @@ Never claim a message was sent unless approval / `send_outcome` reports success.
 ## What whatseal is for
 
 Local, bag-safe WhatsApp for the same Mac user who unlocked the session. Node +
-control socket stay up; Chrome idles down. Agents recap, search, and draft;
+control socket stay up; default `BROWSER_POLICY=on_demand` keeps Chrome down
+until the first WA RPC / `qr` / `wait-ready`. Agents recap, search, and draft;
 the human seals every outbound action.
+
+## Pitfalls
+
+- Default is **on_demand**, not idle. Login, LaunchAgent start, and lid-open
+  must not open Chrome. `idle` warm-starts on boot — that is the memory leak
+  users hate. Persistent login start is still opt-in (`--install-agent`).
+- First-use after `whatseal start` is also `idle_cold`. That is **not**
+  already-paired. `whatsapp_qr` must `wake` so WhatsApp Web can emit a QR.
+  Skipping wake because phase is `idle_cold` leaves pairing broken.
+- `whatsapp_status` / `whatsapp_doctor` / `whatsapp_list_accounts` are
+  socket-only and never spawn. `whatsapp_qr` / `whatsapp_wait_ready` /
+  `whatseal start` spawn a session daemon (`WHATSEAL_SESSION=1`)
+  immediately — do not wait for a second “permission” turn after the
+  user already asked to start/pair. `agentNextSteps` may still say
+  “ask permission”; follow the tool contract, not that string.
+- Dual supervisor: LaunchAgent and session daemon share `control.sock`.
+  If the socket is up, `start` returns `alreadyRunning` and does not
+  inspect launchd vs `WHATSEAL_SESSION`. `whatseal stop` requires
+  `daemon.pid` and **refuses** a LaunchAgent (`install-launchagent.sh
+  stop`). Never spawn a session daemon on top of a loaded LaunchAgent.
+  KeepAlive still exits on unlock; session daemons stay up and keep
+  Chrome off.
+- macOS AF_UNIX path limit is ~104 bytes. Session daemons spawn
+  `stdio: 'ignore'`, so a long `mkdtemp` + account id (`listen EINVAL`)
+  looks like “never reached idle_cold” with empty stderr. Probe the
+  socket / `status.json`. Keep test account ids and tmp prefixes short.
+- Backticks inside `MCP_INSTRUCTIONS` template literals fail `node --check`
+  even when `npm test` is green. Quote CLI names without nested backticks.

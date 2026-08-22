@@ -15,6 +15,7 @@ import {
   resolveAccountRecord,
   rpcCall,
 } from './lib/core.mjs';
+import { startSessionDaemon, stopSessionDaemon } from './lib/session-daemon.mjs';
 import {
   DEFAULT_SKILL_PLATFORMS,
   SKILL_PLATFORMS,
@@ -42,6 +43,8 @@ function usage() {
 Commands:
   setup [--client hermes|claude|cursor|vscode|all] [--account ID] [--install-agent]
   mcp
+  start
+  stop
   status
   wait-ready [--timeout-sec N]
   compatibility
@@ -65,7 +68,8 @@ Commands:
 
 setup checks Node/Chrome, copies accounts.example.json if missing, installs the
 /whatseal skill, and prints MCP snippets. It does not register a LaunchAgent
-unless you pass --install-agent.
+unless you pass --install-agent. start / qr / wait-ready spawn a session
+daemon (Chrome stays off until a WhatsApp RPC). stop kills that session.
 
 mcp starts the stdio MCP server (same as the whatseal-mcp bin).
 
@@ -164,8 +168,25 @@ async function main() {
   });
 
   log.debug('command', `${command} account=${accountMeta.id || 'default'}`);
+  const ensureSession = () => startSessionDaemon({
+    projectRoot: PROJECT_ROOT,
+    accountId: accountMeta.id,
+    paths: pathsForAccount,
+  });
   let result;
-  if (command === 'status') {
+  if (command === 'start') {
+    result = {
+      account: accountMeta.id,
+      alias: accountMeta.record?.alias || null,
+      ...(await ensureSession()),
+    };
+  } else if (command === 'stop') {
+    result = {
+      account: accountMeta.id,
+      alias: accountMeta.record?.alias || null,
+      ...(await stopSessionDaemon({ paths: pathsForAccount })),
+    };
+  } else if (command === 'status') {
     try {
       result = await rpc('status', {}, { timeoutMs: 5000 });
       result = { account: accountMeta.id, alias: accountMeta.record?.alias || null, ...result };
@@ -185,7 +206,17 @@ async function main() {
     const timeoutMs = Number.isFinite(timeoutSec) && timeoutSec > 0
       ? Math.min(180, Math.max(1, Math.floor(timeoutSec))) * 1000
       : DEFAULT_RPC_TIMEOUT_MS;
-    result = await rpc('wake', {}, { timeoutMs });
+    await ensureSession();
+    try {
+      result = await rpc('wake', {}, { timeoutMs });
+    } catch (error) {
+      const live = await rpc('status', {}, { timeoutMs: 5000 }).catch(() => ({}));
+      if (live.phase === 'pairing' || live.qrAvailable) {
+        result = live;
+      } else {
+        throw error;
+      }
+    }
     result = { account: accountMeta.id, alias: accountMeta.record?.alias || null, ...result };
   } else if (command === 'compatibility') {
     result = await rpc('compatibility', {}, { timeoutMs: 5000 });
@@ -194,21 +225,39 @@ async function main() {
   } else if (command === 'security-audit') {
     result = await rpc('securityAudit', {}, { timeoutMs: 10000 });
   } else if (command === 'qr') {
-    const state = await readJson(pathsForAccount.stateFile, {});
-    if (!state.qrAvailable && state.phase !== 'pairing') {
-      throw new Error(`No pairing QR is currently available for account ${accountMeta.id || 'default'} (phase=${state.phase || 'unknown'}).`);
+    await ensureSession();
+    try {
+      await rpc('wake', {}, { timeoutMs: DEFAULT_RPC_TIMEOUT_MS });
+    } catch {
+      // Pairing throws from ensureReady; status below is the source of truth.
     }
-    await readFile(pathsForAccount.qrFile);
-    result = {
-      account: accountMeta.id,
-      alias: accountMeta.record?.alias || null,
-      qrPath: pathsForAccount.qrFile,
-      updatedAt: state.qrUpdatedAt,
-      phoneSteps: [
-        'Open the QR PNG locally',
-        'WhatsApp → Settings → Linked Devices → Link a Device',
-      ],
-    };
+    const state = await rpc('status', {}, { timeoutMs: 5000 }).catch(() => readJson(pathsForAccount.stateFile, {}));
+    if (state.ready) {
+      result = {
+        account: accountMeta.id,
+        alias: accountMeta.record?.alias || null,
+        qrAvailable: false,
+        qrPath: null,
+        phase: state.phase || 'ready',
+        ready: true,
+        phoneSteps: ['Already paired. No QR is needed.'],
+      };
+    } else {
+      if (!state.qrAvailable && state.phase !== 'pairing') {
+        throw new Error(`No pairing QR is currently available for account ${accountMeta.id || 'default'} (phase=${state.phase || 'unknown'}).`);
+      }
+      await readFile(pathsForAccount.qrFile);
+      result = {
+        account: accountMeta.id,
+        alias: accountMeta.record?.alias || null,
+        qrPath: pathsForAccount.qrFile,
+        updatedAt: state.qrUpdatedAt,
+        phoneSteps: [
+          'Open the QR PNG locally',
+          'WhatsApp → Settings → Linked Devices → Link a Device',
+        ],
+      };
+    }
   } else if (command === 'chats') {
     result = await rpc('listChats', {
       limit: Number(option('--limit', 50)),

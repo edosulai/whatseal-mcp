@@ -33,10 +33,10 @@ LOCK_POWER_GUARD="${LOCK_POWER_GUARD:-1}"
 LOCK_POWER_GUARD_INTERVAL_MS="${LOCK_POWER_GUARD_INTERVAL_MS:-5000}"
 # Optional smoke-test override: locked|unlocked. Leave empty in production installs.
 LOCK_POWER_GUARD_FORCE="${LOCK_POWER_GUARD_FORCE:-}"
-# Browser memory policy (default idle) — same contract as instaseal:
+# Browser memory policy (default on_demand) — same contract names as instaseal:
 # always = Chrome always hot; idle = warm start then idle-close; on_demand = cold until first WA RPC.
 # IDLE_CHROME_MS default 15m; 0 disables idle-close. Legacy BROWSER_IDLE_MS still accepted.
-BROWSER_POLICY="${BROWSER_POLICY:-idle}"
+BROWSER_POLICY="${BROWSER_POLICY:-on_demand}"
 if [[ -n "${IDLE_CHROME_MS:-}" ]]; then
   :
 elif [[ -n "${BROWSER_IDLE_MS:-}" ]]; then
@@ -247,7 +247,7 @@ ${account_args}
     <key>LOCK_POWER_GUARD</key><string>${LOCK_POWER_GUARD}</string>
     <key>LOCK_POWER_GUARD_INTERVAL_MS</key><string>${LOCK_POWER_GUARD_INTERVAL_MS}</string>
   ${force_entry}
-    <!-- Browser memory policy (default idle). always|idle|on_demand; IDLE_CHROME_MS default 15m -->
+    <!-- Browser memory policy (default on_demand). always|idle|on_demand; IDLE_CHROME_MS default 15m -->
     <key>BROWSER_POLICY</key><string>${BROWSER_POLICY}</string>
     <key>IDLE_CHROME_MS</key><string>${IDLE_CHROME_MS}</string>
     <key>MAX_HOT_BROWSERS</key><string>${MAX_HOT_BROWSERS}</string>

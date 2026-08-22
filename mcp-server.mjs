@@ -21,6 +21,7 @@ import {
 } from './lib/core.mjs';
 import { isIdleColdPhase } from './lib/browser-lifecycle.mjs';
 import { resolveAccountsFile } from './lib/platform.mjs';
+import { startSessionDaemon } from './lib/session-daemon.mjs';
 
 const require = createRequire(import.meta.url);
 const { verbose, help } = parseCommonArgs(process.argv.slice(2));
@@ -34,7 +35,7 @@ Before ANY WhatsApp content or send action:
 1. Call whatsapp_list_accounts or whatsapp_doctor (preferred first call in a new chat).
 2. If ready=false, explain userMessage to the user and follow agentNextSteps. Do NOT invent chats/messages.
 3. If code=IDLE_COLD: Chrome is down on purpose. Call whatsapp_wait_ready (timeoutSec=180) then retry the read. Do not start extra accounts or scan a QR.
-4. If code=BACKEND_UNAVAILABLE or BACKEND_STOPPED: ask permission, then have the user run the provided start/install command (or confirm before any shell start).
+4. If code=BACKEND_UNAVAILABLE or BACKEND_STOPPED from status/doctor/list_accounts: those tools never spawn. Tell the user, then only start if they asked: whatsapp_wait_ready / whatsapp_qr spawn a session daemon immediately; whatseal start does the same. Persistent login start remains opt-in (--install-agent).
 5. If code=NEEDS_PAIRING: call whatsapp_qr, show the local PNG path, tell user to scan via WhatsApp → Settings → Linked Devices → Link a Device. Poll whatsapp_wait_ready.
 6. Reads (list/read/search/unread_digest) never need Touch ID and never mark chats as seen. The first read after idle_cold wakes Chrome and can take up to ~3 minutes.
 7. Sends/replies/reactions/mark-read are two-phase ONLY:
@@ -67,6 +68,14 @@ async function resolveAccount(accountParam) {
 async function routedRpcCall(method, params, { timeoutMs = DEFAULT_RPC_TIMEOUT_MS, account = null } = {}) {
   const { paths: accountPathSet } = await resolveAccount(account);
   return rpcCall(method, params, { timeoutMs, socketPath: accountPathSet.socket });
+}
+
+async function ensureAccountSession(accountMeta) {
+  return startSessionDaemon({
+    projectRoot: PROJECT_ROOT,
+    accountId: accountMeta.id,
+    paths: accountMeta.paths,
+  });
 }
 
 function response(result) {
@@ -153,7 +162,7 @@ function register(name, config, method, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
 }
 
 server.registerTool('whatsapp_list_accounts', {
-  description: 'List all configured WhatsApp accounts with IDs, aliases, and connection status. Preferred discovery tool before using account-specific operations.',
+  description: 'List all configured WhatsApp accounts with IDs, aliases, and connection status. Preferred discovery tool before using account-specific operations. Does not spawn a session daemon.',
   inputSchema: {},
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, async () => {
@@ -180,7 +189,7 @@ server.registerTool('whatsapp_list_accounts', {
 });
 
 server.registerTool('whatsapp_status', {
-  description: 'Check whether the private local WhatsApp linked-device backend is paired and ready. Returns structured guidance when the backend is stopped, pairing, or syncing. Does not read messages.',
+  description: 'Check whether the private local WhatsApp linked-device backend is paired and ready. Returns structured guidance when the backend is stopped, pairing, or syncing. Does not read messages and does not spawn a session daemon.',
   inputSchema: {
     account: z.string().optional().describe('Account ID or alias. Omit to use the default account.'),
   },
@@ -200,7 +209,7 @@ server.registerTool('whatsapp_status', {
 });
 
 server.registerTool('whatsapp_doctor', {
-  description: 'One-shot diagnosis for agents: configured accounts, backend readiness, pairing/QR hints, and exact next steps/commands. Call this first in a new chat when WhatsApp tools fail or status is unknown.',
+  description: 'One-shot diagnosis for agents: configured accounts, backend readiness, pairing/QR hints, and exact next steps/commands. Call this first in a new chat when WhatsApp tools fail or status is unknown. Does not spawn a session daemon.',
   inputSchema: {
     account: z.string().optional().describe('Optional account to highlight. Omit to diagnose default + summarize all accounts.'),
   },
@@ -250,7 +259,7 @@ server.registerTool('whatsapp_doctor', {
 });
 
 server.registerTool('whatsapp_qr', {
-  description: 'Return the private pairing QR PNG path and phone scan instructions when the backend is in pairing mode. Does not print QR pixels. If not pairing, returns structured next steps instead.',
+  description: 'Return the private pairing QR PNG path and phone scan instructions when the backend is in pairing mode. Does not print QR pixels. If not pairing, returns structured next steps instead. Spawns a session daemon if the backend is stopped.',
   inputSchema: {
     account: z.string().optional().describe('Account ID or alias. Omit to use the default account.'),
   },
@@ -258,6 +267,12 @@ server.registerTool('whatsapp_qr', {
 }, async ({ account } = {}) => {
   try {
     const accountMeta = await resolveAccount(account || null);
+    await ensureAccountSession(accountMeta);
+    try {
+      await routedRpcCall('wake', {}, { timeoutMs: DEFAULT_RPC_TIMEOUT_MS, account: account || null });
+    } catch {
+      // Pairing throws from ensureReady; live status below is the source of truth.
+    }
     const status = await readAccountStatus({
       accountId: accountMeta.id,
       pathsForAccount: accountMeta.paths,
@@ -307,7 +322,7 @@ server.registerTool('whatsapp_qr', {
 });
 
 server.registerTool('whatsapp_wait_ready', {
-  description: 'Wait until the backend is ready. After idle_cold this wakes Chrome (up to ~3 minutes). Also used after starting the service or while the user scans a pairing QR. Returns structured status/guidance on ready, pairing, lock-pause, or timeout.',
+  description: 'Wait until the backend is ready. Spawns a session daemon if the backend is stopped. After idle_cold this wakes Chrome (up to ~3 minutes). Also used after starting the service or while the user scans a pairing QR. Returns structured status/guidance on ready, pairing, lock-pause, or timeout.',
   inputSchema: {
     account: z.string().optional().describe('Account ID or alias. Omit to use the default account.'),
     timeoutSec: z.number().int().min(1).max(180).default(180).describe('Seconds to wait before returning timeout guidance. Default 180 covers a cold Chrome wake.'),
@@ -317,6 +332,7 @@ server.registerTool('whatsapp_wait_ready', {
 }, async ({ account, timeoutSec = 180, intervalMs = 2000 } = {}) => {
   try {
     const accountMeta = await resolveAccount(account || null);
+    await ensureAccountSession(accountMeta);
     const deadline = Date.now() + (timeoutSec * 1000);
     let last = null;
     let attempts = 0;

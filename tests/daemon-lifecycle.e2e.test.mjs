@@ -260,6 +260,69 @@ test('daemon stays cold and TCP-free, then lock resume exits without deadlock', 
   assert.match(getStderr(), /event=shutdown-complete detail=signal=lock-power-resume/);
 });
 
+test('session daemon stays up after lock resume and does not open Chrome', {
+  timeout: 35_000,
+  skip: isDarwin ? false : 'lock-power probes are Darwin-only',
+}, async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'whatseal-sess-e2e-'));
+  const accountId = 'sess';
+  const stateRoot = path.join(temporaryRoot, 'state');
+  const dataRoot = path.join(temporaryRoot, 'data');
+  const lockStateFile = path.join(temporaryRoot, 'lock-state.json');
+  const lockHelper = path.join(temporaryRoot, 'lock-state-helper');
+  const httpPort = await reserveLoopbackPort();
+  await writeLockState(lockStateFile, false);
+  await writeFile(
+    lockHelper,
+    '#!/bin/sh\nexec /bin/cat "$WHATSEAL_E2E_LOCK_STATE"\n',
+    { mode: 0o500 },
+  );
+  await chmod(lockHelper, 0o500);
+
+  const env = daemonEnv({
+    accountId,
+    stateRoot,
+    dataRoot,
+    httpPort,
+    extra: {
+      WHATSEAL_SESSION: '1',
+      WHATSAPP_LOCK_STATE_HELPER: lockHelper,
+      WHATSEAL_E2E_LOCK_STATE: lockStateFile,
+      IDLE_CHROME_MS: '1000',
+      LOCK_POWER_GUARD: '1',
+      LOCK_POWER_GUARD_INTERVAL_MS: '100',
+    },
+  });
+  const socketPath = controlPathForEnv(accountId, env);
+  const { child, getStderr } = spawnDaemon(env);
+  let childExited = false;
+  child.once('exit', () => {
+    childExited = true;
+  });
+
+  t.after(async () => {
+    if (!childExited) stopChild(child, { force: true });
+    await rm(temporaryRoot, { recursive: true, force: true });
+  });
+
+  await waitUntilCold(socketPath, getStderr);
+
+  await writeLockState(lockStateFile, true);
+  await waitFor(async () => {
+    const next = await rpcCall('status', {}, { timeoutMs: 1000, socketPath }).catch(() => null);
+    return next?.phase === 'paused_by_lock' && next?.paused_by_lock === true ? next : null;
+  }, { message: `session daemon did not enter paused_by_lock\n${getStderr()}` });
+
+  await writeLockState(lockStateFile, false);
+  const resumed = await waitFor(async () => {
+    if (childExited) throw new Error(`session daemon exited on lock-resume\n${getStderr()}`);
+    const next = await rpcCall('status', {}, { timeoutMs: 1000, socketPath }).catch(() => null);
+    return next?.phase === 'idle_cold' && next?.paused_by_lock === false ? next : null;
+  }, { message: `session daemon did not return to idle_cold after unlock\n${getStderr()}` });
+  assert.equal(resumed.chromeAlive, false);
+  assert.equal(childExited, false);
+});
+
 test('explicit Web API opt-in binds loopback without waking cold Chrome', { timeout: 20_000 }, async (t) => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'whatseal-http-e2e-'));
   const accountId = 'http-e2e';

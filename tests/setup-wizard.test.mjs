@@ -84,6 +84,7 @@ test('Darwin setup copies missing accounts, installs skill, and does not autosta
     assert.equal(result.launchAgent.installed, false);
     assert.equal(agentCalls.length, 0);
     assert.match(result.nextSteps.join('\n'), /whatseal qr/);
+    assert.match(result.nextSteps.join('\n'), /starts a session daemon/);
     assert.equal(result.snippets.stdio.command, 'npx');
   } finally {
     await rm(homeDir, { recursive: true, force: true });

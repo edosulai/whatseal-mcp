@@ -33,7 +33,7 @@ or pairing, follow that skill before improvising. On Hermes, attach MCP with
 ## Browser memory policy (built-in)
 
 - Contract shared with instaseal (identical names):
-  - `BROWSER_POLICY=idle|on_demand|always` (default `idle`)
+  - `BROWSER_POLICY=idle|on_demand|always` (default `on_demand`)
   - `IDLE_CHROME_MS` default `900000` (15m); `0` = never idle-close
   - Status: `chromeAlive`, `browserPolicy`, `idleChromeMs`, `idleForMs`, `lastRpcAt`
   - Cold phase: `idle_cold` (legacy readers may still see aliases)

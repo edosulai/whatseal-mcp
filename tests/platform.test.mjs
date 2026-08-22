@@ -14,10 +14,12 @@ import {
 } from '../lib/control-transport.mjs';
 import {
   accountPaths,
+  assertFilesystemControlSocketPath,
   controlTransportAddress,
   defaultAccountRoots,
   describeInstallSupport,
   describeLockPowerSupport,
+  maxFilesystemControlSocketPathBytes,
   normalizePlatform,
   pathSecurityPassed,
   resolveAccountLayout,
@@ -117,6 +119,25 @@ test('Windows control transport is a named pipe, not a filesystem socket', () =>
   assert.equal(describeControlTransport('darwin').kind, 'unix-socket');
 });
 
+test('filesystem control sockets fail closed past the AF_UNIX path limit', () => {
+  assert.equal(maxFilesystemControlSocketPathBytes('darwin'), 103);
+  assert.equal(maxFilesystemControlSocketPathBytes('linux'), 107);
+  assert.equal(maxFilesystemControlSocketPathBytes('win32'), null);
+  assert.equal(
+    assertFilesystemControlSocketPath('/tmp/whatseal-state/control.sock', { platform: 'darwin' }),
+    '/tmp/whatseal-state/control.sock',
+  );
+  const longPath = `/tmp/${'x'.repeat(120)}/control.sock`;
+  assert.throws(
+    () => assertFilesystemControlSocketPath(longPath, { platform: 'darwin' }),
+    /AF_UNIX limit is 103/,
+  );
+  assert.equal(
+    assertFilesystemControlSocketPath('\\\\.\\pipe\\whatsapp-agent-alice-deadbeefdeadbeef', { platform: 'win32' }),
+    '\\\\.\\pipe\\whatsapp-agent-alice-deadbeefdeadbeef',
+  );
+});
+
 test('accountPaths stays compatible and exposes per-account Darwin sockets', () => {
   const paths = accountPaths('alpha', {
     platform: 'darwin',
@@ -147,14 +168,17 @@ test('install and lock-power stay Darwin-only; others degrade safe', () => {
   assert.equal(describeLockPowerSupport('win32').supported, false);
 });
 
-test('backend lifecycle commands keep LaunchAgent on Darwin and refuse install elsewhere', () => {
+test('backend lifecycle commands keep LaunchAgent install opt-in and session start everywhere', () => {
   const darwin = backendLifecycleCommands('alpha', '/tmp/whatseal-mcp', { platform: 'darwin' });
   assert.match(darwin.install, /install-launchagent\.sh install --account alpha/);
-  assert.match(darwin.start, /install-launchagent\.sh start --account alpha/);
+  assert.equal(darwin.start, 'node cli.mjs start --account alpha');
+  assert.equal(darwin.stop, 'node cli.mjs stop --account alpha');
+  assert.equal(darwin.qrCli, 'node cli.mjs qr --account alpha');
 
   const linux = backendLifecycleCommands('alpha', '/tmp/whatseal-mcp', { platform: 'linux' });
   assert.match(linux.install, /not shipped/i);
-  assert.match(linux.start, /not shipped/i);
+  assert.equal(linux.start, 'node cli.mjs start --account alpha');
+  assert.equal(linux.stop, 'node cli.mjs stop --account alpha');
   assert.match(linux.status, /node cli\.mjs status --account alpha/);
   assert.equal(linux.qrCli, 'node cli.mjs qr --account alpha');
 });

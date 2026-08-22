@@ -14,11 +14,13 @@ Omit it to use the configured default. Override with `WHATSEAL_ACCOUNTS`.
 | --- | --- | --- |
 | `whatsapp_doctor` | `status` + saved-state guidance | Preferred first call |
 | `whatsapp_list_accounts` | — | Discover ids / aliases / readiness |
-| `whatsapp_status` | `status` | Socket-only; does not wake Chrome |
-| `whatsapp_qr` | `qr` | Local PNG path only; user scans on the phone |
-| `whatsapp_wait_ready` | `wait-ready [--timeout-sec N]` | RPC `wake` → `ensureReady`. Default 180s |
+| `whatsapp_status` | `status` | Socket-only; does not spawn or wake Chrome |
+| `whatsapp_qr` | `qr` | Spawns a session daemon if stopped; local PNG path only; user scans on the phone |
+| `whatsapp_wait_ready` | `wait-ready [--timeout-sec N]` | Spawns a session daemon if stopped, then RPC `wake` → `ensureReady`. Default 180s |
+| — | `start` / `stop` | Session daemon only. `stop` refuses without `daemon.pid` (LaunchAgent). Persistent login remains `--install-agent` |
 
-`whatsapp_status` / `whatsapp_compatibility` stay socket-only. Do not treat
+`whatsapp_status` / `whatsapp_doctor` / `whatsapp_list_accounts` /
+`whatsapp_compatibility` stay socket-only and never spawn. Do not treat
 `idle_cold` as stopped — use `wait_ready` instead of starting another account.
 
 ## Diagnostics

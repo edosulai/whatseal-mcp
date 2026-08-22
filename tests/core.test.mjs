@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   DraftStore,
   DEFAULT_RPC_TIMEOUT_MS,
+  backendLifecycleCommands,
   buildReadinessGuidance,
   buildUnreadDigest,
   classifyRpcError,
@@ -214,8 +215,11 @@ test('readiness guidance for stopped backend is actionable', () => {
   assert.equal(guidance.ready, false);
   assert.equal(guidance.code, 'BACKEND_UNAVAILABLE');
   assert.match(guidance.userMessage, /not running|stopped/i);
-  assert.ok(guidance.commands.start.includes('--account alpha'));
+  assert.equal(guidance.commands.start, 'node cli.mjs start --account alpha');
   assert.ok(guidance.agentNextSteps.length > 0);
+  assert.ok(guidance.agentNextSteps.some((step) => /cli\.mjs start --account alpha/.test(step)));
+  assert.ok(guidance.agentNextSteps.some((step) => /never spawn/i.test(step)));
+  assert.equal(backendLifecycleCommands('alpha', '/tmp/whatseal-mcp').start, 'node cli.mjs start --account alpha');
 });
 
 test('classifyRpcError maps not-ready and socket failures', () => {
@@ -231,6 +235,7 @@ test('classifyRpcError maps not-ready and socket failures', () => {
     { accountId: 'alpha', alias: 'work', projectRoot: '/tmp/whatseal-mcp', savedState: { phase: 'ready' } },
   );
   assert.equal(unavailable.code, 'BACKEND_UNAVAILABLE');
+  assert.equal(unavailable.commands.start, 'node cli.mjs start --account alpha');
   assert.match(unavailable.commands.install, /install-launchagent\.sh install --account alpha/);
 
   const closedWhileCold = classifyRpcError(

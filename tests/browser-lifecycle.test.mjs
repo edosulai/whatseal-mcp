@@ -13,12 +13,13 @@ import {
   shouldStartBrowserOnBoot,
 } from '../lib/browser-lifecycle.mjs';
 
-test('browser policy defaults to idle and accepts aliases', () => {
-  assert.equal(parseBrowserPolicy({}), 'idle');
+test('browser policy defaults to on_demand and accepts aliases', () => {
+  assert.equal(parseBrowserPolicy({}), 'on_demand');
   assert.equal(parseBrowserPolicy({ BROWSER_POLICY: 'always' }), 'always');
+  assert.equal(parseBrowserPolicy({ BROWSER_POLICY: 'idle' }), 'idle');
   assert.equal(parseBrowserPolicy({ BROWSER_POLICY: 'on-demand' }), 'on_demand');
   assert.equal(parseBrowserPolicy({ WHATSAPP_BROWSER_POLICY: 'hot' }), 'always');
-  assert.equal(parseBrowserPolicy({ BROWSER_POLICY: 'nope' }), 'idle');
+  assert.equal(parseBrowserPolicy({ BROWSER_POLICY: 'nope' }), 'on_demand');
 });
 
 test('IDLE_CHROME_MS defaults to 15m; legacy BROWSER_IDLE_MS accepted; 0 disables', () => {

@@ -14,7 +14,7 @@
   <img alt="Node.js" src="https://img.shields.io/badge/node-%3E%3D22-3c873a?logo=nodedotjs&amp;logoColor=white">
   <img alt="MCP" src="https://img.shields.io/badge/MCP-stdio-0d9488">
   <img alt="Version" src="https://img.shields.io/badge/version-2.0.3-1f2328">
-  <img alt="Default policy" src="https://img.shields.io/badge/browser-idle%20%7C%20bag--safe-0f766e">
+  <img alt="Default policy" src="https://img.shields.io/badge/browser-on__demand%20%7C%20bag--safe-0f766e">
 </p>
 
 <p align="center">
@@ -63,12 +63,13 @@ Requires **macOS**, **Node.js 22+**, and **Google Chrome**. Touch ID is the send
 ```bash
 npm install -g whatseal    # or: npx whatseal setup
 whatseal setup
-whatseal qr                # scan from the phone
+whatseal qr                # starts a session daemon if needed, then scan from the phone
 # Phone: WhatsApp → Settings → Linked Devices → Link a Device
 whatseal wait-ready
+whatseal stop              # optional: kill the session daemon when you are done
 ```
 
-`setup` copies `accounts.example.json` → `~/.local/state/whatsapp-agent/accounts.json` only if missing (a checkout `accounts.json` still wins when present). It also installs the `/whatseal` skill and prints MCP snippets. It does **not** register a LaunchAgent unless you pass `--install-agent`. Override with `WHATSEAL_ACCOUNTS`.
+`setup` copies `accounts.example.json` → `~/.local/state/whatsapp-agent/accounts.json` only if missing (a checkout `accounts.json` still wins when present). It also installs the `/whatseal` skill and prints MCP snippets. It does **not** register a LaunchAgent unless you pass `--install-agent`. `qr` / `wait-ready` / `start` spawn a session daemon (Chrome stays off until a WhatsApp RPC). Persistent login start remains opt-in. Override with `WHATSEAL_ACCOUNTS`.
 
 Point your agent at stdio:
 
@@ -136,7 +137,7 @@ From a checkout, `mcp-wrapper.sh` still works as a thin exec of `bin/whatseal-mc
 
 Deeper threat model: [`RISK-CONTROLS.md`](./RISK-CONTROLS.md). Tested runtime tuples: [`KNOWN-GOOD.md`](./KNOWN-GOOD.md).
 
-The MCP process only speaks stdio. It does **not** auto-start Chrome. Stopped or unpaired tools return structured guidance (`code`, `userMessage`, `agentNextSteps`, exact shell commands) instead of failing opaquely.
+The MCP process only speaks stdio. `whatsapp_qr` / `whatsapp_wait_ready` spawn a **session daemon** if the backend is stopped (no LaunchAgent). Stopped or unpaired tools return structured guidance (`code`, `userMessage`, `agentNextSteps`, exact shell commands) instead of failing opaquely. Persistent login start remains opt-in (`--install-agent`).
 
 `idle_cold` is not stopped. The control socket is up; the next WhatsApp read wakes Chrome (up to ~3 minutes). Use `whatsapp_wait_ready` (`timeoutSec=180`) or `whatseal wait-ready` — do not start extra accounts or scan a new QR.
 
@@ -264,7 +265,7 @@ The short version: **the model never gets a send capability.** It gets a draft. 
 - Unofficial `whatsapp-web.js` client. Not the WhatsApp Business Platform. The official platform does not expose a personal inbox.
 - Dedicated headless `LocalAuth` directory. Never reuses the personal Chrome profile or a shared Playwright profile.
 - **Bag-safe by default.** Screen lock or lid close pauses the Chrome/WhatsApp hot path (`paused_by_lock=true`), stops health polling and call automation, and stays nearly idle. Resume only after unlock **and** lid open, and only if this guard paused the backend. `LOCK_POWER_GUARD=0` disables it. No caffeinate / prevent-sleep.
-- **Idle browser policy (default).** Node + Unix socket stay up; Chrome closes after `IDLE_CHROME_MS` without WhatsApp RPC (default 15 minutes; `0` = never idle-close). Next WA method cold-starts via `ensureBrowser` / `ensureReady` (up to ~3 minutes). `BROWSER_POLICY=always` is zero wake latency; `on_demand` stays cold until the first WA RPC even after unlock. Soft cap: `MAX_HOT_BROWSERS=1`. Status contract (shared with instaseal): `chromeAlive`, `browserPolicy`, `idleChromeMs`, `idleForMs`, `lastRpcAt`; cold phase `idle_cold`.
+- **On-demand browser policy (default).** Node + Unix socket stay up; Chrome stays cold until the first WhatsApp RPC (`BROWSER_POLICY=on_demand`). `idle` warms on boot then closes Chrome after `IDLE_CHROME_MS` without WhatsApp RPC (default 15 minutes; `0` = never idle-close). Next WA method cold-starts via `ensureBrowser` / `ensureReady` (up to ~3 minutes). `BROWSER_POLICY=always` is zero wake latency. Soft cap: `MAX_HOT_BROWSERS=1`. Status contract (shared with instaseal): `chromeAlive`, `browserPolicy`, `idleChromeMs`, `idleForMs`, `lastRpcAt`; cold phase `idle_cold`.
 - Unix-domain socket mode `0600`. No TCP listener by default. General Web API is explicit opt-in (`WHATSEAL_WEB_API=1`); Web sends still use the immutable native approval. Compressed call-bot audio can enable a random-token, active-call-bound loopback route; the default decoded WAV path needs no TCP.
 - Persistent profile under `~/.local/share/whatsapp-agent/auth` (`0700`): linked-device credentials plus browser-side WhatsApp caches. Never commit, sync, or paste it into chat.
 - Pairing QR files under `~/.local/state/whatsapp-agent` (`0600`), removed immediately after authentication.
@@ -292,8 +293,10 @@ Every script supports `--verbose` / `-v`.
 ./install-launchagent.sh stop
 ./install-launchagent.sh remove          # keeps linked-device credentials
 
+node cli.mjs start --account alpha       # session daemon (no LaunchAgent)
+node cli.mjs stop --account alpha
 node cli.mjs status --account alpha      # paused_by_lock / lockPower / chromeAlive / idleChromeMs
-node cli.mjs wait-ready --account alpha  # wake Chrome after idle_cold (up to ~3 min)
+node cli.mjs wait-ready --account alpha  # spawn/wake Chrome after idle_cold (up to ~3 min)
 node cli.mjs compatibility
 node cli.mjs compatibility-self-test
 node approve-baseline.mjs --approve-current
@@ -323,16 +326,16 @@ node cli.mjs status --account alpha   # reconnect/ready when unlocked
 
 Real-world check: lock the screen or close the lid, wait ~5–10s, confirm no WhatsApp Chrome processes and `paused_by_lock=true`; unlock/open the lid and confirm resume without a manual stop/start.
 
-### Browser memory (default `idle`)
+### Browser memory (default `on_demand`)
 
 | Policy | Behavior |
 | --- | --- |
-| `idle` (default) | Warm-start Chrome after unlock; close it after `IDLE_CHROME_MS` with no WA RPC; next WA RPC / `wait-ready` wakes (up to ~3 minutes) |
+| `on_demand` (default) | Do not open Chrome on boot/unlock; open only on first WA RPC / `qr` / `wait-ready` |
+| `idle` | Warm-start Chrome after unlock; close it after `IDLE_CHROME_MS` with no WA RPC; next WA RPC / `wait-ready` wakes (up to ~3 minutes) |
 | `always` | Keep Chrome hot while unlocked (highest memory) |
-| `on_demand` | Do not open Chrome on boot/unlock; open only on first WA RPC |
 
 ```bash
-./install-launchagent.sh install --account alpha                 # idle + 15 minutes
+./install-launchagent.sh install --account alpha                 # on_demand + 15 minutes
 IDLE_CHROME_MS=60000 ./install-launchagent.sh install --account alpha
 BROWSER_POLICY=on_demand ./install-launchagent.sh install --account alpha
 ./install-launchagent.sh stop --account alpha                    # prefer this over always-hot
