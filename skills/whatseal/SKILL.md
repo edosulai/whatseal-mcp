@@ -172,9 +172,11 @@ the human seals every outbound action.
   stop`). Never spawn a session daemon on top of a loaded LaunchAgent.
   KeepAlive still exits on unlock; session daemons stay up and keep
   Chrome off.
-- macOS AF_UNIX path limit is ~104 bytes. Session daemons spawn
-  `stdio: 'ignore'`, so a long `mkdtemp` + account id (`listen EINVAL`)
-  looks like “never reached idle_cold” with empty stderr. Probe the
-  socket / `status.json`. Keep test account ids and tmp prefixes short.
+- macOS AF_UNIX path limit is 103 bytes (darwin) / 107 (linux). Session
+  start fail-closes before listen if the socket path is too long.
+  Logs go to `$STATE/logs/session-daemon.{out,err}.log` (not stdio
+  ignore). `daemon.lock` serializes start; `launchagent-owned` refuses
+  a session spawn on top of LaunchAgent. Keep test account ids and
+  tmp prefixes short.
 - Backticks inside `MCP_INSTRUCTIONS` template literals fail `node --check`
   even when `npm test` is green. Quote CLI names without nested backticks.
